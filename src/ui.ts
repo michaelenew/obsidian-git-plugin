@@ -243,6 +243,9 @@ export class SyncPanel extends ItemView {
 
 		el.createEl("div", { text: statusLine(this.plugin), cls: `sgs-status sgs-${status.phase}` });
 		if (status.phase === "error") el.createEl("div", { text: status.message, cls: "sgs-error" });
+		if (status.phase === "offline") {
+			el.createEl("div", { text: `Can't reach GitHub${status.message && status.message !== "Offline" ? ` (${status.message})` : ""}. Edits are kept and will sync automatically when the connection is back.`, cls: "sgs-muted" });
+		}
 
 		const buttons = el.createDiv("sgs-buttons");
 		if (status.phase === "logged-out") {

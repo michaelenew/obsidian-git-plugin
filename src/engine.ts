@@ -50,6 +50,8 @@ export interface TreeChange {
 	mode: string;
 	/** null deletes the path */
 	sha: string | null;
+	/** Text to store for this path, sent inside the tree request (so no separate upload); its id must equal sha. */
+	content?: string;
 }
 
 export interface RemoteStore {
@@ -58,6 +60,8 @@ export interface RemoteStore {
 	getBlob(sha: string): Promise<Uint8Array>;
 	createBlob(data: Uint8Array): Promise<string>;
 	createTree(baseTree: string, changes: TreeChange[]): Promise<string>;
+	/** Every file in a tree, by path. */
+	listTree(treeSha: string): Promise<Map<string, RemoteEntry>>;
 	createCommit(message: string, tree: string, parents: string[]): Promise<string>;
 	/** Create or move a branch. Returns false if a non-forced move is not a fast-forward. */
 	updateRef(branch: string, sha: string, force: boolean): Promise<boolean>;
@@ -106,10 +110,19 @@ export interface EngineOptions {
 	forbidden?: () => string[];
 	now?: () => Date;
 	log?: (msg: string) => void;
+	/** Short progress text for long syncs, e.g. "uploading 120 of 400" */
+	progress?: (msg: string) => void;
 }
 
 const MAX_ATTEMPTS = 4;
 const CONCURRENCY = 4;
+// GitHub limits how fast an account may create content (about 80 requests a
+// minute), so files that can be sent as text go inside the tree request,
+// many per request, and only the rest are uploaded one by one.
+const INLINE_MAX_FILE = 1024 * 1024;
+const TREE_BATCH_BYTES = 4 * 1024 * 1024;
+const TREE_BATCH_FILES = 500;
+const BLOB_CONCURRENCY = 2;
 
 export class SyncEngine {
 	private treeCache: { commit: string; tree: RemoteTree } | null = null;
@@ -241,7 +254,14 @@ export class SyncEngine {
 				});
 			}
 		}
-		await runLimited(work, CONCURRENCY);
+		let done = 0;
+		await runLimited(
+			work.map((w) => async () => {
+				await w();
+				if (work.length > 10) this.opts.progress?.(`downloading ${++done} of ${work.length}`);
+			}),
+			CONCURRENCY,
+		);
 
 		const changes = mode === "full" && toPush.size > 0 ? await this.prepareUpload(toPush, remote) : [];
 		if (changes.length === 0) {
@@ -253,7 +273,7 @@ export class SyncEngine {
 
 		const commit = await this.remote.createCommit(
 			this.commitMessage(changes),
-			await this.remote.createTree(tree.treeSha, changes.map((c) => c.change)),
+			await this.buildTree(tree.treeSha, changes.map((c) => c.change)),
 			[head],
 		);
 		if (this.opts.deviceBranch) await this.remote.updateRef(this.opts.deviceBranch, commit, true);
@@ -278,6 +298,7 @@ export class SyncEngine {
 		remote: Map<string, RemoteEntry>,
 	): Promise<Array<{ change: TreeChange; kind: ChangeKind }>> {
 		const out: Array<{ change: TreeChange; kind: ChangeKind }> = [];
+		const blobs: Array<{ change: TreeChange; data: Uint8Array }> = [];
 		const forbidden = (this.opts.forbidden?.() ?? []).filter((s) => s.length >= 8);
 
 		await runLimited(
@@ -296,11 +317,22 @@ export class SyncEngine {
 						throw new Error(`Refusing to upload "${path}": it contains your GitHub login token. Delete the token from that file.`);
 					}
 				}
-				const blob = await this.remote.createBlob(data);
-				if (blob !== sha) throw new Error(`GitHub stored "${path}" with an unexpected id; aborting`);
-				out.push({ change: { path, mode: r?.mode ?? "100644", sha }, kind: r ? "modified" : "added" });
+				const change: TreeChange = { path, mode: r?.mode ?? "100644", sha };
+				const text = data.length <= INLINE_MAX_FILE ? exactText(data) : null;
+				if (text !== null) change.content = text;
+				else blobs.push({ change, data });
+				out.push({ change, kind: r ? "modified" : "added" });
 			}),
-			CONCURRENCY,
+			CONCURRENCY * 4,
+		);
+
+		let uploaded = 0;
+		await runLimited(
+			blobs.map(({ change, data }) => async () => {
+				this.opts.progress?.(`uploading file ${++uploaded} of ${blobs.length}`);
+				await this.uploadBlob(change.path, data, change.sha!);
+			}),
+			BLOB_CONCURRENCY,
 		);
 
 		// A scan that silently missed files would look like a mass delete; refuse that.
@@ -310,6 +342,44 @@ export class SyncEngine {
 			throw new Error(`Refusing to delete ${deleted} of ${tracked} files on GitHub in one sync. If this is intended, delete them on GitHub directly.`);
 		}
 		return out.sort((a, b) => a.change.path.localeCompare(b.change.path));
+	}
+
+	private async uploadBlob(path: string, data: Uint8Array, sha: string) {
+		const blob = await this.remote.createBlob(data);
+		if (blob !== sha) throw new Error(`GitHub stored "${path}" with an unexpected id; aborting`);
+	}
+
+	/** Add changes to baseTree in batches, then check GitHub stored every inline text exactly. */
+	private async buildTree(baseTree: string, changes: TreeChange[]): Promise<string> {
+		const batches: TreeChange[][] = [[]];
+		let bytes = 0;
+		for (const c of changes) {
+			const size = c.content?.length ?? 0;
+			const last = batches[batches.length - 1];
+			if (last.length && (last.length >= TREE_BATCH_FILES || bytes + size > TREE_BATCH_BYTES)) {
+				batches.push([]);
+				bytes = 0;
+			}
+			batches[batches.length - 1].push(c);
+			bytes += size;
+		}
+		let tree = baseTree;
+		let sent = 0;
+		for (const batch of batches) {
+			tree = await this.remote.createTree(tree, batch);
+			sent += batch.length;
+			if (changes.length > 10) this.opts.progress?.(`uploading ${sent} of ${changes.length}`);
+		}
+
+		const inline = changes.filter((c) => c.content !== undefined);
+		if (!inline.length) return tree;
+		const stored = await this.remote.listTree(tree);
+		const wrong = inline.filter((c) => stored.get(c.path)?.sha !== c.sha);
+		if (!wrong.length) return tree;
+		// Shouldn't happen; if GitHub altered any text, send those files byte-for-byte instead.
+		this.log(`re-uploading ${wrong.length} files GitHub stored differently`);
+		for (const c of wrong) await this.uploadBlob(c.path, new TextEncoder().encode(c.content!), c.sha!);
+		return this.remote.createTree(tree, wrong.map((c) => ({ path: c.path, mode: c.mode, sha: c.sha })));
 	}
 
 	private commitMessage(changes: Array<{ change: TreeChange; kind: ChangeKind }>): string {
@@ -406,10 +476,27 @@ export class SyncEngine {
 	}
 }
 
+/** The file as text, if it is UTF-8 that converts back to exactly the same bytes. */
+function exactText(data: Uint8Array): string | null {
+	const text = decodeText(data);
+	if (text === null) return null;
+	const back = new TextEncoder().encode(text);
+	return back.length === data.length && back.every((b, i) => b === data[i]) ? text : null;
+}
+
+/** Run tasks, at most `limit` at once. On the first failure, start no new ones, let running ones finish, then throw. */
 async function runLimited(tasks: Array<() => Promise<void>>, limit: number): Promise<void> {
 	let next = 0;
+	let failure: { error: unknown } | null = null;
 	const worker = async () => {
-		while (next < tasks.length) await tasks[next++]();
+		while (!failure && next < tasks.length) {
+			try {
+				await tasks[next++]();
+			} catch (error) {
+				failure ??= { error };
+			}
+		}
 	};
 	await Promise.all(Array.from({ length: Math.min(limit, tasks.length) }, worker));
+	if (failure) throw (failure as { error: unknown }).error;
 }

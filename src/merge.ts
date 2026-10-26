@@ -17,7 +17,7 @@ export function isTextPath(path: string): boolean {
 /** Decode as UTF-8, or return null if the bytes are not valid text. */
 export function decodeText(data: Uint8Array): string | null {
 	try {
-		const text = new TextDecoder("utf-8", { fatal: true }).decode(data);
+		const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(data);
 		return text.includes("\0") ? null : text;
 	} catch {
 		return null;

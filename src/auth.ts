@@ -2,6 +2,13 @@ import { requestUrl } from "obsidian";
 
 export class AuthError extends Error {}
 
+/** GitHub couldn't be reached at all (offline, no signal, DNS, timeout). Sync resumes when back online. */
+export class NetworkError extends Error {}
+
+export function isOffline(): boolean {
+	return typeof navigator !== "undefined" && navigator.onLine === false;
+}
+
 /**
  * A GitHub login. GitHub App logins come with an access token that lasts
  * 8 hours and a refresh token (6 months) that trades for a new pair.
@@ -19,17 +26,31 @@ export interface Credentials {
 const EARLY_MS = 5 * 60 * 1000;
 
 export async function postForm(url: string, params: Record<string, string>): Promise<any> {
-	const res = await requestUrl({
-		url,
-		method: "POST",
-		headers: { Accept: "application/json" },
-		contentType: "application/x-www-form-urlencoded",
-		body: new URLSearchParams(params).toString(),
-		throw: false,
-	});
-	if (res.status >= 500) throw new Error(`GitHub login service error (${res.status})`);
-	if (res.status >= 400) throw new AuthError(`GitHub login failed (${res.status})`);
-	return res.json;
+	if (isOffline()) throw new NetworkError("Offline");
+	let res;
+	try {
+		res = await requestUrl({
+			url,
+			method: "POST",
+			headers: { Accept: "application/json" },
+			contentType: "application/x-www-form-urlencoded",
+			body: new URLSearchParams(params).toString(),
+			throw: false,
+		});
+	} catch (e) {
+		throw new NetworkError(`Couldn't reach GitHub's login service: ${e instanceof Error ? e.message : e}`);
+	}
+	if (res.status < 400) return res.json;
+	let detail = "";
+	try {
+		detail = res.json?.error_description ?? res.json?.error ?? "";
+	} catch {
+		/* not json */
+	}
+	const what = `GitHub login service: ${res.status}${detail ? ` ${detail}` : ""} (POST ${new URL(url).pathname})`;
+	// Busy or broken on GitHub's side: try again later, keep the login.
+	if (res.status === 429 || res.status >= 500) throw new Error(what);
+	throw new AuthError(what);
 }
 
 export function credentialsFrom(j: any): Credentials {
@@ -75,16 +96,19 @@ export class Auth {
 	}
 
 	private async doRefresh(c: Credentials): Promise<string> {
-		if (!c.refresh || (c.refreshExpiresAt && Date.now() > c.refreshExpiresAt)) {
-			throw new AuthError("GitHub login expired");
+		if (!c.refresh) throw new AuthError("GitHub rejected the login, and this kind of login can't be renewed");
+		if (c.refreshExpiresAt && Date.now() > c.refreshExpiresAt) {
+			throw new AuthError(`GitHub login expired: it could be renewed until ${new Date(c.refreshExpiresAt).toLocaleDateString()}`);
 		}
-		// A network failure here throws a plain Error: keep the login and retry later.
+		// A network failure here throws NetworkError: keep the login and retry later.
 		const j = await postForm("https://github.com/login/oauth/access_token", {
 			client_id: this.clientId(),
 			grant_type: "refresh_token",
 			refresh_token: c.refresh,
 		});
-		if (!j.access_token) throw new AuthError(`GitHub login expired (${j.error ?? "refresh refused"})`);
+		if (!j.access_token) {
+			throw new AuthError(`GitHub refused to renew the login: ${j.error_description ?? j.error ?? "no reason given"}${j.error ? ` (${j.error})` : ""}`);
+		}
 		const next = credentialsFrom(j);
 		this.store(next);
 		return next.access;
