@@ -99,8 +99,20 @@ export interface SyncResult {
 	skipped: string[];
 	/** Files GitHub wouldn't take this time; everything else was synced. Retried next sync. */
 	failed: Array<{ path: string; error: string }>;
-	/** Large files held back so the rest could be pushed first */
-	deferred: number;
+}
+
+/** A non-text file (or a text file over 1 MB) waiting to be pushed in its own commit. */
+interface Attachment {
+	change: TreeChange;
+	kind: ChangeKind;
+	data: Uint8Array;
+	/** GitHub's version when this sync started; if it changes before we push, we back off */
+	remoteSha: string | undefined;
+}
+
+interface Head {
+	commit: string;
+	treeSha: string;
 }
 
 export interface EngineOptions {
@@ -120,15 +132,13 @@ export interface EngineOptions {
 
 const MAX_ATTEMPTS = 4;
 const CONCURRENCY = 4;
-// GitHub limits how fast an account may create content (about 80 requests a
-// minute), so files that can be sent as text go inside the tree request,
-// many per request, and only the rest are uploaded one by one.
+// Notes (and deletions) go in one commit, sent as text inside the tree
+// request, hundreds per request. Attachments then follow one commit each, so
+// a problem file never holds up notes, and each one is easy to find or strip
+// from history later (their messages end with an "Attachment: <path>" line).
 const INLINE_MAX_FILE = 1024 * 1024;
 const TREE_BATCH_BYTES = 4 * 1024 * 1024;
 const TREE_BATCH_FILES = 500;
-const BLOB_CONCURRENCY = 2;
-// Big attachments go in a second commit, after everything else is safely pushed.
-const LARGE_FILE = 5 * 1024 * 1024;
 // GitHub refuses files over 100 MB.
 const MAX_FILE = 100 * 1024 * 1024;
 
@@ -152,25 +162,14 @@ export class SyncEngine {
 	}
 
 	async sync(mode: Mode): Promise<SyncResult> {
-		const first = await this.attempts(mode, false);
-		if (!first.deferred) return first;
-		this.log(`pushed everything else; now uploading ${first.deferred} large file${first.deferred > 1 ? "s" : ""}`);
-		const second = await this.attempts(mode, true);
-		return {
-			...second,
-			commit: second.commit ?? first.commit,
-			pulled: [...first.pulled, ...second.pulled],
-			pushed: [...first.pushed, ...second.pushed],
-			merged: [...first.merged, ...second.merged],
-			conflicts: [...first.conflicts, ...second.conflicts],
-		};
-	}
-
-	private async attempts(mode: Mode, allowLarge: boolean): Promise<SyncResult> {
 		for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-			const result = await this.attempt(mode, allowLarge);
-			if (result) return result;
-			this.log(`${this.opts.branch} moved while pushing; retrying (${attempt}/${MAX_ATTEMPTS})`);
+			const pass = await this.attempt(mode);
+			if (!pass) {
+				this.log(`${this.opts.branch} moved while pushing; retrying (${attempt}/${MAX_ATTEMPTS})`);
+				continue;
+			}
+			if (pass.attachments.length) await this.pushAttachments(pass.attachments, pass.head, pass.result);
+			return pass.result;
 		}
 		throw new Error(`${this.opts.branch} kept changing while pushing; will try again later`);
 	}
@@ -190,13 +189,17 @@ export class SyncEngine {
 		return changes.sort((a, b) => a.path.localeCompare(b.path));
 	}
 
-	/** One pass. Returns null when main moved under us and the pass must be redone. */
-	private async attempt(mode: Mode, allowLarge: boolean): Promise<SyncResult | null> {
+	/**
+	 * One pass: pull, merge, and push notes in one commit. Returns null when
+	 * main moved under us and the pass must be redone; otherwise the
+	 * attachments still to push and the head to push them onto.
+	 */
+	private async attempt(mode: Mode): Promise<{ result: SyncResult; attachments: Attachment[]; head: Head } | null> {
 		const head = await this.remote.getHead(this.opts.branch);
 		const result: SyncResult = {
-			mode, head, commit: null, pulled: [], pushed: [], merged: [], conflicts: [], skipped: [], failed: [], deferred: 0,
+			mode, head, commit: null, pulled: [], pushed: [], merged: [], conflicts: [], skipped: [], failed: [],
 		};
-		if (mode === "pull" && head === this.settledHead) return result;
+		if (mode === "pull" && head === this.settledHead) return { result, attachments: [], head: { commit: head, treeSha: "" } };
 
 		const tree = await this.getTree(head);
 		const local = await this.scanLocal();
@@ -286,21 +289,18 @@ export class SyncEngine {
 			CONCURRENCY,
 		);
 
-		const changes = mode === "full" && toPush.size > 0 ? await this.prepareUpload(toPush, remote, result, allowLarge) : [];
+		const { changes, attachments } =
+			mode === "full" && toPush.size > 0 ? await this.prepareUpload(toPush, remote, result) : { changes: [], attachments: [] };
 		if (changes.length === 0) {
 			this.state.lastCommit = head;
 			this.settledHead = settled ? head : null;
 			await this.opts.saveState();
-			return result;
+			return { result, attachments, head: { commit: head, treeSha: tree.treeSha } };
 		}
 
-		const commit = await this.remote.createCommit(
-			this.commitMessage(changes),
-			await this.buildTree(tree.treeSha, changes.map((c) => c.change)),
-			[head],
-		);
-		if (this.opts.deviceBranch) await this.remote.updateRef(this.opts.deviceBranch, commit, true);
-		if (!(await this.remote.updateRef(this.opts.branch, commit, false))) {
+		const treeSha = await this.buildTree(tree.treeSha, changes.map((c) => c.change));
+		const commit = await this.remote.createCommit(this.commitMessage(changes), treeSha, [head]);
+		if (!(await this.publish(commit))) {
 			// Pulled files are on disk and recorded in base, so the retry starts from there.
 			await this.opts.saveState();
 			return null;
@@ -313,17 +313,81 @@ export class SyncEngine {
 		result.commit = commit;
 		result.pushed = changes.map((c) => ({ path: c.change.path, kind: c.kind }));
 		this.log(`pushed ${commit.slice(0, 7)} (${changes.length} files)`);
-		return result;
+		return { result, attachments, head: { commit, treeSha } };
+	}
+
+	/** Point the device branch and then main at commit. False if main moved meanwhile. */
+	private async publish(commit: string): Promise<boolean> {
+		if (this.opts.deviceBranch) await this.remote.updateRef(this.opts.deviceBranch, commit, true);
+		return this.remote.updateRef(this.opts.branch, commit, false);
+	}
+
+	/** One commit per attachment, smallest first. A failure is reported for that file only. */
+	private async pushAttachments(attachments: Attachment[], head: Head, result: SyncResult): Promise<void> {
+		attachments.sort((a, b) => a.data.length - b.data.length);
+		let n = 0;
+		for (const a of attachments) {
+			const { path } = a.change;
+			const size = formatSize(a.data.length);
+			this.opts.progress?.(`uploading attachment ${++n} of ${attachments.length} (${path.split("/").pop()}, ${size})`);
+			try {
+				const next = await this.pushAttachment(a, head, result);
+				if (!next) continue;
+				head = next;
+				result.commit = head.commit;
+				result.pushed.push({ path, kind: a.kind });
+				this.log(`pushed ${head.commit.slice(0, 7)} (attachment ${path}, ${size})`);
+			} catch (e) {
+				if (e instanceof Error && e.name === "AuthError") throw e;
+				// A dropped connection or timeout: if GitHub still answers, it was this file, not the connection.
+				if (e instanceof Error && e.name === "NetworkError") {
+					await this.remote.getHead(this.opts.branch).catch(() => {
+						throw e;
+					});
+				}
+				const error = `Couldn't sync attachment "${path}" (${size}): ${e instanceof Error ? e.message : e}`;
+				this.log(error);
+				result.failed.push({ path, error });
+			}
+		}
+	}
+
+	/** Returns the new head, or null if the file changed on GitHub meanwhile (merged next sync). */
+	private async pushAttachment(a: Attachment, head: Head, result: SyncResult): Promise<Head | null> {
+		const { path, sha } = a.change;
+		await this.uploadBlob(path, a.data, sha!);
+		for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+			const treeSha = await this.remote.createTree(head.treeSha, [{ path, mode: a.change.mode, sha }]);
+			const name = path.split("/").pop();
+			const message = `${this.opts.deviceName}: attachment ${name} (${formatSize(a.data.length)})\n\n${a.kind}: ${path}\n\nAttachment: ${path}\n`;
+			const commit = await this.remote.createCommit(message, treeSha, [head.commit]);
+			if (await this.publish(commit)) {
+				this.state.base[path] = sha!;
+				this.state.lastCommit = commit;
+				if (this.settledHead === head.commit) this.settledHead = commit;
+				await this.opts.saveState();
+				return { commit, treeSha };
+			}
+			// Someone pushed meanwhile: go on top of theirs, unless they changed this very file.
+			const latest = await this.remote.getHead(this.opts.branch);
+			const tree = await this.getTree(latest);
+			this.settledHead = null;
+			if (tree.entries.get(path)?.sha !== a.remoteSha) {
+				result.skipped.push(path);
+				return null;
+			}
+			head = { commit: latest, treeSha: tree.treeSha };
+		}
+		throw new Error(`${this.opts.branch} kept changing while pushing`);
 	}
 
 	private async prepareUpload(
 		paths: Set<string>,
 		remote: Map<string, RemoteEntry>,
 		result: SyncResult,
-		allowLarge: boolean,
-	): Promise<Array<{ change: TreeChange; kind: ChangeKind }>> {
+	): Promise<{ changes: Array<{ change: TreeChange; kind: ChangeKind }>; attachments: Attachment[] }> {
 		const out: Array<{ change: TreeChange; kind: ChangeKind }> = [];
-		const blobs: Array<{ change: TreeChange; data: Uint8Array }> = [];
+		const attachments: Attachment[] = [];
 		const forbidden = (this.opts.forbidden?.() ?? []).filter((s) => s.length >= 8);
 
 		await runLimited(
@@ -343,56 +407,21 @@ export class SyncEngine {
 					}
 				}
 				const change: TreeChange = { path, mode: r?.mode ?? "100644", sha };
+				const kind = r ? "modified" : "added";
 				const text = data.length <= INLINE_MAX_FILE ? exactText(data) : null;
-				if (text !== null) change.content = text;
-				else blobs.push({ change, data });
-				out.push({ change, kind: r ? "modified" : "added" });
+				if (text !== null) {
+					change.content = text;
+					out.push({ change, kind });
+				} else if (data.length > MAX_FILE) {
+					const error = `Couldn't sync "${path}" (${formatSize(data.length)}): GitHub doesn't accept files over 100 MB`;
+					this.log(error);
+					result.failed.push({ path, error });
+				} else {
+					attachments.push({ change, kind, data, remoteSha: r?.sha });
+				}
 			}),
 			CONCURRENCY * 4,
 		);
-
-		const failed = new Set<string>();
-		const fail = (path: string, error: string) => {
-			this.log(error);
-			result.failed.push({ path, error });
-			failed.add(path);
-		};
-		for (const b of blobs.filter((b) => b.data.length > MAX_FILE)) {
-			fail(b.change.path, `"${b.change.path}" (${formatSize(b.data.length)}) is over GitHub's 100 MB limit per file; not synced`);
-		}
-		let toUpload = blobs.filter((b) => b.data.length <= MAX_FILE);
-		// Hold big files back if anything else is waiting, so they can't delay it.
-		const big = toUpload.filter((b) => b.data.length > LARGE_FILE);
-		if (!allowLarge && big.length && out.length > big.length + failed.size) {
-			for (const b of big) failed.add(b.change.path);
-			result.deferred = big.length;
-			toUpload = toUpload.filter((b) => b.data.length <= LARGE_FILE);
-		}
-		// Smallest first: one slow file then holds up as little as possible.
-		toUpload.sort((a, b) => a.data.length - b.data.length);
-
-		let uploaded = 0;
-		await runLimited(
-			toUpload.map(({ change, data }) => async () => {
-				const name = change.path.split("/").pop();
-				this.opts.progress?.(`uploading attachment ${++uploaded} of ${toUpload.length} (${name}, ${formatSize(data.length)})`);
-				if (data.length > LARGE_FILE) this.log(`uploading ${change.path} (${formatSize(data.length)})…`);
-				try {
-					await this.uploadBlob(change.path, data, change.sha!);
-				} catch (e) {
-					if (e instanceof Error && e.name === "AuthError") throw e;
-					// A dropped connection or timeout: if GitHub still answers, it was this file, not the connection.
-					if (e instanceof Error && e.name === "NetworkError") {
-						await this.remote.getHead(this.opts.branch).catch(() => {
-							throw e;
-						});
-					}
-					fail(change.path, `Uploading "${change.path}" (${formatSize(data.length)}) failed: ${e instanceof Error ? e.message : e}`);
-				}
-			}),
-			BLOB_CONCURRENCY,
-		);
-		if (failed.size) out.splice(0, out.length, ...out.filter((c) => !failed.has(c.change.path)));
 
 		// A scan that silently missed files would look like a mass delete; refuse that.
 		const deleted = out.filter((c) => c.kind === "deleted").length;
@@ -400,7 +429,7 @@ export class SyncEngine {
 		if (deleted > 20 && deleted > tracked / 2) {
 			throw new Error(`Refusing to delete ${deleted} of ${tracked} files on GitHub in one sync. If this is intended, delete them on GitHub directly.`);
 		}
-		return out.sort((a, b) => a.change.path.localeCompare(b.change.path));
+		return { changes: out.sort((a, b) => a.change.path.localeCompare(b.change.path)), attachments };
 	}
 
 	private async uploadBlob(path: string, data: Uint8Array, sha: string) {

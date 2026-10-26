@@ -344,11 +344,12 @@ test("a big first upload sends text inside a few tree requests, and only binarie
 	const r = await engine.sync("full");
 	assert.equal(r.pushed.length, 1202);
 	assert.equal(gh.blobUploads, 1, "only the binary file is uploaded on its own");
-	assert.equal(gh.treeCalls, 3, "1201 text files in batches of 500");
+	assert.equal(gh.treeCalls, 4, "1201 text files in batches of 500, then one for the attachment");
 	const files = gh.files();
 	assert.equal(files["notes/n1199.md"], "note 1199\n");
 	assert.equal(files["bom.md"], "\ufeffstarts with a BOM");
-	assert.ok(progress.includes("uploading 1202 of 1202"));
+	assert.ok(progress.includes("uploading 1201 of 1201"));
+	assert.ok(progress.includes("uploading attachment 1 of 1 (pic.png, 5 B)"));
 });
 
 test("if GitHub stores inline text differently, those files are re-sent byte-for-byte", async () => {
@@ -403,7 +404,7 @@ test("a file GitHub refuses is reported and retried later; everything else still
 	};
 	const r = await engine.sync("full");
 	assert.deepEqual(r.failed.map((f) => f.path), ["big.pdf"]);
-	assert.match(r.failed[0].error, /^Uploading "big\.pdf" \(6 B\) failed: GitHub 401 Unauthorized on POST \/git\/blobs: Bad credentials$/);
+	assert.match(r.failed[0].error, /^Couldn't sync attachment "big\.pdf" \(6 B\): GitHub 401 Unauthorized on POST \/git\/blobs: Bad credentials$/);
 	assert.deepEqual(Object.keys(gh.files()).sort(), ["README.md", "note.md", "small.png"]);
 	assert.equal(state.base["big.pdf"], undefined, "still pending");
 
@@ -431,26 +432,46 @@ test("a connection drop during file uploads still stops the sync", async () => {
 	assert.deepEqual(Object.keys(gh.files()), ["README.md"]);
 });
 
-test("large attachments go in a second commit after everything else", async () => {
+test("notes go in one commit, then each attachment in its own commit, smallest first", async () => {
+	const gh = new FakeGitHub();
+	await gh.seed({ "README.md": "hi" });
+	const { disk, engine, state } = device(gh, "mac");
+	disk.put("a.md", "A");
+	disk.put("b.md", "B");
+	disk.files.set("big.webm", { data: new Uint8Array(5000).fill(0xff), mtime: 0 });
+	disk.files.set("small.png", { data: new Uint8Array([0x89, 0x00, 0xff]), mtime: 0 });
+	const r = await engine.sync("full");
+
+	const messages: string[] = [];
+	for (let c = gh.refs.get("main")!; gh.commits.get(c)!.parents.length; c = gh.commits.get(c)!.parents[0]) {
+		messages.unshift(gh.commits.get(c)!.message);
+	}
+	assert.equal(messages.length, 3);
+	assert.match(messages[0], /^mac: a\.md, b\.md\n/);
+	assert.equal(messages[1], "mac: attachment small.png (3 B)\n\nadded: small.png\n\nAttachment: small.png\n");
+	assert.equal(messages[2], "mac: attachment big.webm (5 KB)\n\nadded: big.webm\n\nAttachment: big.webm\n");
+	assert.equal(r.commit, gh.refs.get("main"));
+	assert.equal(r.pushed.length, 4);
+	assert.equal(gh.refs.get("sync/mac"), gh.refs.get("main"));
+	assert.ok(state.base["big.webm"]);
+
+	// Nothing left to do afterwards.
+	const again = await engine.sync("full");
+	assert.equal(again.commit, null);
+});
+
+test("if someone pushes during attachment uploads, the attachment goes on top of theirs", async () => {
 	const gh = new FakeGitHub();
 	await gh.seed({ "README.md": "hi" });
 	const { disk, engine } = device(gh, "mac");
-	disk.put("note.md", "text");
-	disk.files.set("small.png", { data: new Uint8Array([0x89, 0x00, 0xff]), mtime: 0 });
-	const big = new Uint8Array(6 * 1024 * 1024).fill(0xff);
-	disk.files.set("Recording.webm", { data: big, mtime: 0 });
-	const commits: string[][] = [];
-	const createCommit = gh.createCommit.bind(gh);
-	gh.createCommit = async (message, tree, parents) => {
-		commits.push(Object.keys(Object.fromEntries(gh.trees.get(tree)!)).sort());
-		return createCommit(message, tree, parents);
-	};
-	const r = await engine.sync("full");
-	assert.equal(commits.length, 2);
-	assert.deepEqual(commits[0], ["README.md", "note.md", "small.png"]);
-	assert.ok(commits[1].includes("Recording.webm"));
-	assert.equal(r.pushed.length, 3);
-	assert.equal(r.commit, gh.refs.get("main"));
+	disk.files.set("pic.png", { data: new Uint8Array([0x89, 0x00, 0xff]), mtime: 0 });
+	gh.beforeMainUpdate = () => gh.edit({ "agent.md": "from an agent" });
+	await engine.sync("full");
+	const files = gh.files();
+	assert.equal(files["agent.md"], "from an agent");
+	assert.ok(files["pic.png"] !== undefined);
+	await engine.sync("full");
+	assert.equal(disk.get("agent.md"), "from an agent");
 });
 
 test("an upload that times out while GitHub is still reachable fails only that file", async () => {

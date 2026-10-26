@@ -274,10 +274,17 @@ export default class SimpleGitSync extends Plugin {
 		if (parts.length) this.addLog(`${parts.join(", ")}${r.commit ? ` (${r.commit.slice(0, 7)})` : ""}`);
 		this.status.failed = r.mode === "full" ? r.failed : this.status.failed;
 		if (r.failed.length) {
-			const names = r.failed.map((f) => f.path).join("\n");
-			if (names !== this.lastFailedShown) {
-				new Notice(`Git sync couldn't upload:\n${names}\nEverything else synced. It will retry; details in the sync panel.`, 15000);
-				this.lastFailedShown = names;
+			// Stays up until dismissed, and only reappears if the set of failures changes.
+			const key = r.failed.map((f) => f.error).join("\n");
+			if (key !== this.lastFailedShown) {
+				const n = r.failed.length;
+				new Notice(
+					`Git sync: ${n === 1 ? "1 file wasn't" : `${n} files weren't`} sent to GitHub. Everything else synced. ` +
+						`${n === 1 ? "It stays" : "They stay"} on this device and will be retried each sync.\n\n` +
+						r.failed.map((f) => `• ${f.error}`).join("\n\n"),
+					0,
+				);
+				this.lastFailedShown = key;
 			}
 		} else if (r.mode === "full") {
 			this.lastFailedShown = "";
@@ -520,6 +527,6 @@ export function statusLine(p: SimpleGitSync): string {
 		case "syncing": return `Git: ${p.status.message || "syncing…"}`;
 		case "offline": return `Git: offline${p.dirtyCount() ? ` · ${p.dirtyCount()} unpushed` : ""}`;
 		case "error": return "Git: sync error";
-		default: return `Git: synced ${ago(p.status.lastSync)}${p.dirtyCount() ? ` · ${p.dirtyCount()} unpushed` : ""}`;
+		default: return `Git: synced ${ago(p.status.lastSync)}${p.dirtyCount() ? ` · ${p.dirtyCount()} unpushed` : ""}${p.status.failed.length ? ` · ${p.status.failed.length} not sent` : ""}`;
 	}
 }

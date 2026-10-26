@@ -28,7 +28,7 @@ Each device remembers the last version of the vault it agreed on with GitHub (th
   Files that can't be merged line-by-line (images, PDFs, …) keep this device's copy and save GitHub's copy beside it as `name (conflict 2026-10-26 1430).ext`.
 - Deleted on one side but edited on the other → the edited version is kept.
 
-Local changes become one commit on top of the latest `main`, whose message lists the files changed (`android-x7k2: Groceries.md, Trip.md`). The commit is first written to the device's own branch, `sync/<device>`, then `main` is moved forward to it. If someone else updated `main` in that instant, the plugin re-merges and tries again.
+Local changes to notes (and any deletions) become one commit on top of the latest `main`, whose message lists the files changed (`android-x7k2: Groceries.md, Trip.md`). Attachments (any non-text file, or a text file over 1 MB) then follow with one commit each, smallest first, so a problem with one attachment never holds up notes. Each attachment commit contains only that file and ends with an `Attachment: <path>` line, so they're easy to find (`git log --grep '^Attachment:'`) or strip from history later (for example with `git filter-repo --path <path> --invert-paths`). If GitHub won't take an attachment, the device that tried shows a notice with the file, its size and GitHub's exact answer; it stays on that device and is retried each sync. The commit is first written to the device's own branch, `sync/<device>`, then `main` is moved forward to it. If someone else updated `main` in that instant, the plugin re-merges and tries again.
 
 Deleted files go to Obsidian's trash, and everything ever synced stays in the repository's history.
 
@@ -95,7 +95,7 @@ For a new device, start from an empty vault. If the vault already has files, the
 
 - Phones may pause Obsidian a few seconds after it goes to the background. A push that didn't finish is completed next time Obsidian is opened.
 - Offline is fine: edits are kept, the status shows `Git: offline`, and everything syncs as soon as the connection returns. A sync cut off halfway simply picks up where it left off.
-- GitHub limits how fast an account can create content. Text files are uploaded hundreds at a time in one request; other files (images, PDFs) go one by one, so a first sync with many of them can take a few minutes. When GitHub asks the plugin to slow down, it waits as told and carries on; when GitHub has a hiccup (5xx errors, dropped connections), it retries after 2, 5 and 15 seconds.
+- GitHub limits how fast an account can create content. Notes are uploaded hundreds at a time in one request; attachments go one per commit, so a first sync with many of them can take a few minutes. When GitHub asks the plugin to slow down, it waits as told and carries on; when GitHub has a hiccup (5xx errors, dropped connections), it retries after 2, 5 and 15 seconds. GitHub doesn't accept files over 100 MB; those are reported and skipped.
 - Every problem appears in the sync panel's activity log with GitHub's exact response: status code, which request, GitHub's message, and its request id.
 - Repositories with more than about 100,000 files are not supported.
 - File modes other than normal and executable files (symlinks, submodules) on GitHub are ignored.
