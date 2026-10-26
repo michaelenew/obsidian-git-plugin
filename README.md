@@ -77,9 +77,8 @@ GitHub's "log in with a code" flow needs an app registered on GitHub to identify
 3. Tick **Enable Device Flow**. Untick **Webhook → Active**.
 4. **Repository permissions → Contents: Read and write.** Nothing else.
 5. **Where can this GitHub App be installed?** Only on this account. Create it.
-6. On the app's page, under **Optional features**, opt out of **User-to-server token expiration** (otherwise you'd be asked to log in again every 8 hours).
-7. **Install App** → your account → **Only select repositories** → pick your vault repository.
-8. Copy the **Client ID** (starts with `Iv`) into `DEFAULT_CLIENT_ID` in `src/main.ts` and publish a release. (Alternatively paste it under the plugin's Advanced settings on each device.)
+6. **Install App** → your account → **Only select repositories** → pick your vault repository.
+7. Copy the **Client ID** (starts with `Iv`) into `DEFAULT_CLIENT_ID` in `src/main.ts` and publish a release. (Alternatively paste it under the plugin's Advanced settings on each device.)
 
 ### On each device
 
@@ -93,7 +92,8 @@ For a new device, start from an empty vault. If the vault already has files, the
 
 - The login token is stored with Obsidian's secret storage (`app.secretStorage`; on Obsidian older than 1.11.4, the app's local storage). It is never written to any file in the vault, including the plugin's own `data.json`.
 - The plugin's folder is always excluded from syncing, whatever the settings.
-- Before uploading, every file is checked for the token; if it's found, the sync stops with an error instead of uploading.
+- Logins expire on their own: GitHub App tokens last 8 hours and the plugin quietly swaps them for fresh ones using a refresh token (valid 6 months, and renewed each time). If the login can't be renewed (unused for 6 months, or you revoked it on GitHub), the plugin asks you to log in again; if you dismiss that, it asks again next time you return to Obsidian, at most every 30 minutes. Being offline never logs you out.
+- Before uploading, every file is checked for the login tokens; if it's found, the sync stops with an error instead of uploading.
 - The token is only sent to `api.github.com` and `github.com`.
 - A sync that would delete more than half the files on GitHub (and more than 20) is refused, in case a device ever misreads its own folder as empty.
 

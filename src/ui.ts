@@ -1,5 +1,6 @@
 import { App, ItemView, Modal, Notice, PluginSettingTab, Setting, SuggestModal, WorkspaceLeaf } from "obsidian";
 import type { Change } from "./engine";
+import type { Credentials } from "./auth";
 import { RepoInfo, startDeviceLogin, waitForDeviceLogin } from "./github";
 import type SimpleGitSync from "./main";
 import { ago, statusLine } from "./main";
@@ -12,7 +13,7 @@ export class LoginModal extends Modal {
 	constructor(
 		app: App,
 		private plugin: SimpleGitSync,
-		private onToken: (token: string) => Promise<void>,
+		private onLogin: (credentials: Credentials) => Promise<void>,
 		private onDone: () => void,
 	) {
 		super(app);
@@ -45,9 +46,9 @@ export class LoginModal extends Modal {
 				}),
 			);
 			const waiting = el.createEl("p", { text: "Waiting for approval…", cls: "sgs-muted" });
-			const token = await waitForDeviceLogin(clientId, code, () => this.cancelled);
+			const credentials = await waitForDeviceLogin(clientId, code, () => this.cancelled);
 			waiting.setText("Logged in.");
-			await this.onToken(token);
+			await this.onLogin(credentials);
 			this.close();
 		} catch (e) {
 			if (this.cancelled) return;
@@ -219,9 +220,9 @@ export class SettingsTab extends PluginSettingTab {
 
 		new Setting(el)
 			.setName("GitHub account")
-			.setDesc(plugin.token() ? `Logged in${s.username ? ` as ${s.username}` : ""}. The login is kept in Obsidian's secure storage on this device, never in the vault.` : "Not logged in.")
+			.setDesc(plugin.loggedIn() ? `Logged in${s.username ? ` as ${s.username}` : ""}. The login is kept in Obsidian's secure storage on this device, never in the vault.` : "Not logged in.")
 			.addButton((b) =>
-				plugin.token()
+				plugin.loggedIn()
 					? b.setButtonText("Log out").onClick(async () => {
 						await plugin.logout();
 						this.display();

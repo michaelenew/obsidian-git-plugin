@@ -1,6 +1,7 @@
 import { Notice, Platform, Plugin, TAbstractFile, TFile } from "obsidian";
 import { Change, emptyState, Mode, SyncEngine, SyncResult, SyncState } from "./engine";
-import { AuthError, GitHub } from "./github";
+import { Auth, AuthError, Credentials } from "./auth";
+import { GitHub } from "./github";
 import { LoginModal, PANEL_VIEW, RepoPicker, SettingsTab, SyncPanel } from "./ui";
 import { VaultStore } from "./vaultStore";
 
@@ -75,6 +76,8 @@ export default class SimpleGitSync extends Plugin {
 	private activePath: string | null = null;
 	private listeners = new Set<() => void>();
 	private loginOpen = false;
+	private lastLoginPrompt = 0;
+	readonly auth = new Auth(() => this.credentials(), (c) => this.setCredentials(c), () => this.clientId());
 	statusBar: HTMLElement | null = null;
 
 	async onload() {
@@ -103,7 +106,7 @@ export default class SimpleGitSync extends Plugin {
 			this.registerTriggers();
 			this.activePath = this.app.workspace.getActiveFile()?.path ?? null;
 			this.restartPullTimer();
-			if (!this.token()) this.login();
+			if (!this.loggedIn()) this.login();
 			else if (!this.settings.repo) this.chooseRepo();
 			else this.schedule("full", 0);
 		});
@@ -147,6 +150,9 @@ export default class SimpleGitSync extends Plugin {
 		this.registerDomEvent(document, "visibilitychange", () => {
 			if (document.visibilityState === "hidden") {
 				if (this.dirty.size) this.schedule("full", 0);
+			} else if (!this.loggedIn()) {
+				// Re-ask on return to the app, but not every time if the user keeps dismissing it.
+				if (Date.now() - this.lastLoginPrompt > 30 * 60 * 1000) this.login();
 			} else {
 				this.schedule(this.dirty.size ? "full" : "pull", 0);
 			}
@@ -189,13 +195,13 @@ export default class SimpleGitSync extends Plugin {
 	// ---- syncing --------------------------------------------------------
 
 	async syncNow(mode: Mode) {
-		if (!this.token()) return this.login();
+		if (!this.loggedIn()) return this.login();
 		if (!this.settings.repo) return this.chooseRepo();
 		await this.run(mode, true);
 	}
 
 	private async run(mode: Mode, manual = false): Promise<void> {
-		if (!this.token() || !this.settings.repo) return;
+		if (!this.loggedIn() || !this.settings.repo) return;
 		if (this.running) {
 			if (this.rerun !== "full") this.rerun = mode;
 			return;
@@ -216,9 +222,7 @@ export default class SimpleGitSync extends Plugin {
 			// Whatever was pulled before the error is on disk; remember that.
 			await this.save().catch(() => {});
 			if (e instanceof AuthError) {
-				this.setToken(null);
-				this.setPhase("logged-out", msg);
-				this.login();
+				this.loginExpired(msg);
 			} else {
 				this.setPhase("error", msg);
 				if (manual) new Notice(`Git sync failed: ${msg}`);
@@ -264,13 +268,16 @@ export default class SimpleGitSync extends Plugin {
 		);
 		const branch = this.branch();
 		const device = this.settings.deviceName.replace(/[^A-Za-z0-9._-]+/g, "-") || "device";
-		this.engine = new SyncEngine(store, new GitHub(this.token()!, this.settings.repo), {
+		this.engine = new SyncEngine(store, new GitHub(this.auth, this.settings.repo), {
 			branch,
 			deviceName: device,
 			deviceBranch: this.settings.useDeviceBranch ? `sync/${device}` : null,
 			state: this.state,
 			saveState: () => this.save(),
-			forbidden: () => [this.token() ?? ""],
+			forbidden: () => {
+				const c = this.credentials();
+				return c ? [c.access, c.refresh ?? ""] : [];
+			},
 			log: (m) => this.addLog(m),
 		});
 		return this.engine;
@@ -282,7 +289,7 @@ export default class SimpleGitSync extends Plugin {
 	}
 
 	async pendingChanges(): Promise<Change[]> {
-		if (!this.token() || !this.settings.repo) return [];
+		if (!this.loggedIn() || !this.settings.repo) return [];
 		return this.getEngine().pendingChanges();
 	}
 
@@ -296,18 +303,37 @@ export default class SimpleGitSync extends Plugin {
 
 	// ---- login ----------------------------------------------------------
 
-	/** The token lives in Obsidian's secret storage (or app storage on older versions), never in the vault folder. */
-	token(): string | null {
+	/** The login lives in Obsidian's secret storage (or app storage on older versions), never in the vault folder. */
+	credentials(): Credentials | null {
 		const secrets = (this.app as any).secretStorage;
-		const t = secrets ? secrets.getSecret(TOKEN_ID) : this.app.loadLocalStorage(TOKEN_ID);
-		return t || null;
+		const raw: string | null = secrets ? secrets.getSecret(TOKEN_ID) : this.app.loadLocalStorage(TOKEN_ID);
+		if (!raw) return null;
+		try {
+			const c = JSON.parse(raw);
+			if (c && typeof c.access === "string") return c;
+		} catch {
+			/* a bare token from an earlier version */
+		}
+		return { access: raw };
 	}
 
-	setToken(token: string | null) {
+	private setCredentials(c: Credentials | null) {
+		const raw = c ? JSON.stringify(c) : null;
 		const secrets = (this.app as any).secretStorage;
-		if (secrets) secrets.setSecret(TOKEN_ID, token ?? "");
-		this.app.saveLocalStorage(TOKEN_ID, secrets ? null : token);
-		this.resetEngine();
+		if (secrets) secrets.setSecret(TOKEN_ID, raw ?? "");
+		this.app.saveLocalStorage(TOKEN_ID, secrets ? null : raw);
+	}
+
+	loggedIn(): boolean {
+		return this.credentials() !== null;
+	}
+
+	/** The login can't be refreshed (unused for 6 months, or revoked): ask again. */
+	private loginExpired(reason: string) {
+		this.setCredentials(null);
+		this.setPhase("logged-out", reason);
+		new Notice("Git sync: your GitHub login expired. Please log in again.", 10000);
+		this.login();
 	}
 
 	clientId() {
@@ -317,9 +343,10 @@ export default class SimpleGitSync extends Plugin {
 	login() {
 		if (this.loginOpen) return;
 		this.loginOpen = true;
-		new LoginModal(this.app, this, async (token) => {
-			this.setToken(token);
-			this.settings.username = await new GitHub(token, "").user().catch(() => "");
+		this.lastLoginPrompt = Date.now();
+		new LoginModal(this.app, this, async (credentials) => {
+			this.setCredentials(credentials);
+			this.settings.username = await new GitHub(this.auth, "").user().catch(() => "");
 			await this.save();
 			new Notice(`Logged in to GitHub${this.settings.username ? ` as ${this.settings.username}` : ""}`);
 			if (!this.settings.repo) this.chooseRepo();
@@ -329,19 +356,19 @@ export default class SimpleGitSync extends Plugin {
 	}
 
 	async logout() {
-		this.setToken(null);
+		this.setCredentials(null);
 		this.settings.username = "";
 		await this.save();
 		this.setPhase("logged-out", "");
 	}
 
 	async chooseRepo() {
-		const token = this.token();
-		if (!token) return this.login();
+		if (!this.loggedIn()) return this.login();
 		try {
-			const repos = await new GitHub(token, "").listRepos();
+			const repos = await new GitHub(this.auth, "").listRepos();
 			new RepoPicker(this.app, repos, (repo) => this.setRepo(repo.fullName, repo.defaultBranch)).open();
 		} catch (e) {
+			if (e instanceof AuthError) return this.loginExpired(e.message);
 			new Notice(`Could not list repositories: ${e instanceof Error ? e.message : e}`);
 		}
 	}
@@ -374,7 +401,7 @@ export default class SimpleGitSync extends Plugin {
 	}
 
 	refresh() {
-		if (!this.token()) this.status.phase = "logged-out";
+		if (!this.loggedIn()) this.status.phase = "logged-out";
 		else if (!this.settings.repo) this.status.phase = "no-repo";
 		else if (this.status.phase === "logged-out" || this.status.phase === "no-repo") this.status.phase = "idle";
 		if (this.statusBar) this.statusBar.setText(statusLine(this));

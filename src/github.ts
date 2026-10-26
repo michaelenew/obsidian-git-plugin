@@ -1,12 +1,11 @@
 import { arrayBufferToBase64, requestUrl, RequestUrlResponse } from "obsidian";
+import { Auth, AuthError, Credentials, credentialsFrom, postForm } from "./auth";
 import type { RemoteEntry, RemoteStore, RemoteTree, TreeChange } from "./engine";
 
 // All network traffic goes through Obsidian's requestUrl, which works the same
 // on desktop and mobile. The token is only ever sent to these two hosts.
 const API = "https://api.github.com";
 const WEB = "https://github.com";
-
-export class AuthError extends Error {}
 
 export interface RepoInfo {
 	fullName: string;
@@ -16,16 +15,26 @@ export interface RepoInfo {
 
 export class GitHub implements RemoteStore {
 	constructor(
-		private token: string,
+		private auth: Auth,
 		private repo: string,
 	) {}
 
 	private async call(method: string, path: string, body?: unknown, accept = "application/vnd.github+json"): Promise<RequestUrlResponse> {
-		const res = await requestUrl({
+		const token = await this.auth.accessToken();
+		const res = await this.send(token, method, path, body, accept);
+		if (res.status !== 401) return res;
+		// Expired or revoked: refresh once and retry; if that fails too, the user must log in again.
+		const retry = await this.send(await this.auth.renew(token), method, path, body, accept);
+		if (retry.status === 401) throw new AuthError("GitHub login expired or was revoked");
+		return retry;
+	}
+
+	private send(token: string, method: string, path: string, body: unknown, accept: string): Promise<RequestUrlResponse> {
+		return requestUrl({
 			url: `${API}${path}`,
 			method,
 			headers: {
-				Authorization: `Bearer ${this.token}`,
+				Authorization: `Bearer ${token}`,
 				Accept: accept,
 				"X-GitHub-Api-Version": "2022-11-28",
 				"Cache-Control": "no-cache",
@@ -34,8 +43,6 @@ export class GitHub implements RemoteStore {
 			body: body === undefined ? undefined : JSON.stringify(body),
 			throw: false,
 		});
-		if (res.status === 401) throw new AuthError("GitHub login expired or was revoked");
-		return res;
 	}
 
 	private async json(method: string, path: string, body?: unknown): Promise<any> {
@@ -148,21 +155,8 @@ export interface DeviceCode {
 	expiresAt: number;
 }
 
-async function form(url: string, params: Record<string, string>): Promise<any> {
-	const res = await requestUrl({
-		url,
-		method: "POST",
-		headers: { Accept: "application/json" },
-		contentType: "application/x-www-form-urlencoded",
-		body: new URLSearchParams(params).toString(),
-		throw: false,
-	});
-	if (res.status >= 400) throw new Error(`GitHub login failed (${res.status})`);
-	return res.json;
-}
-
 export async function startDeviceLogin(clientId: string): Promise<DeviceCode> {
-	const j = await form(`${WEB}/login/device/code`, { client_id: clientId, scope: "repo" });
+	const j = await postForm(`${WEB}/login/device/code`, { client_id: clientId, scope: "repo" });
 	if (j.error) throw new Error(j.error_description ?? j.error);
 	return {
 		deviceCode: j.device_code,
@@ -173,18 +167,18 @@ export async function startDeviceLogin(clientId: string): Promise<DeviceCode> {
 	};
 }
 
-/** Wait for the user to approve the code. Resolves to the token. */
-export async function waitForDeviceLogin(clientId: string, code: DeviceCode, cancelled: () => boolean): Promise<string> {
+/** Wait for the user to approve the code. */
+export async function waitForDeviceLogin(clientId: string, code: DeviceCode, cancelled: () => boolean): Promise<Credentials> {
 	let interval = code.interval;
 	while (Date.now() < code.expiresAt) {
 		await new Promise((r) => setTimeout(r, interval * 1000));
 		if (cancelled()) throw new Error("cancelled");
-		const j = await form(`${WEB}/login/oauth/access_token`, {
+		const j = await postForm(`${WEB}/login/oauth/access_token`, {
 			client_id: clientId,
 			device_code: code.deviceCode,
 			grant_type: "urn:ietf:params:oauth:grant-type:device_code",
 		});
-		if (j.access_token) return j.access_token;
+		if (j.access_token) return credentialsFrom(j);
 		if (j.error === "slow_down") interval = (j.interval ?? interval + 5);
 		else if (j.error !== "authorization_pending") throw new Error(j.error_description ?? j.error);
 	}
