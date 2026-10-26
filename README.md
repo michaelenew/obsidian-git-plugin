@@ -94,7 +94,9 @@ For a new device, start from an empty vault. If the vault already has files, the
 ## Limits
 
 - Phones may pause Obsidian a few seconds after it goes to the background. A push that didn't finish is completed next time Obsidian is opened.
-- GitHub allows 5,000 API requests per hour. Normal use needs a small fraction of that, but the first sync of a large vault uses one request per file.
+- Offline is fine: edits are kept, the status shows `Git: offline`, and everything syncs as soon as the connection returns. A sync cut off halfway simply picks up where it left off.
+- GitHub limits how fast an account can create content. Text files are uploaded hundreds at a time in one request; other files (images, PDFs) go one by one, so a first sync with many of them can take a few minutes. When GitHub asks the plugin to slow down, it waits as told and carries on; when GitHub has a hiccup (5xx errors, dropped connections), it retries after 2, 5 and 15 seconds.
+- Every problem appears in the sync panel's activity log with GitHub's exact response: status code, which request, GitHub's message, and its request id.
 - Repositories with more than about 100,000 files are not supported.
 - File modes other than normal and executable files (symlinks, submodules) on GitHub are ignored.
 

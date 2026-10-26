@@ -1,5 +1,5 @@
 import { arrayBufferToBase64, requestUrl, RequestUrlResponse } from "obsidian";
-import { Auth, AuthError, Credentials, credentialsFrom, postForm } from "./auth";
+import { Auth, AuthError, Credentials, credentialsFrom, isOffline, NetworkError, postForm } from "./auth";
 import type { RemoteEntry, RemoteStore, RemoteTree, TreeChange } from "./engine";
 
 // All network traffic goes through Obsidian's requestUrl, which works the same
@@ -17,20 +17,68 @@ export class GitHub implements RemoteStore {
 	constructor(
 		private auth: Auth,
 		private repo: string,
+		/** Told about retries (rate limits, GitHub hiccups), as a line for the activity log. */
+		private onNotice: (msg: string) => void = () => {},
 	) {}
 
 	private async call(method: string, path: string, body?: unknown, accept = "application/vnd.github+json"): Promise<RequestUrlResponse> {
 		const token = await this.auth.accessToken();
-		const res = await this.send(token, method, path, body, accept);
+		const res = await this.sendWithRetries(token, method, path, body, accept);
 		if (res.status !== 401) return res;
-		// Expired or revoked: refresh once and retry; if that fails too, the user must log in again.
-		const retry = await this.send(await this.auth.renew(token), method, path, body, accept);
-		if (retry.status === 401) throw new AuthError("GitHub login expired or was revoked");
-		return retry;
+		this.onNotice(`${describe(res, method, path)}; refreshing the login and retrying`);
+		const fresh = await this.auth.renew(token);
+		const retry = await this.sendWithRetries(fresh, method, path, body, accept);
+		if (retry.status !== 401) return retry;
+		// Only call the login dead if GitHub rejects it for the simplest request too.
+		const check = await this.send(fresh, "GET", "/user", undefined, "application/vnd.github+json");
+		if (check.status === 401) throw new AuthError(`GitHub no longer accepts this device's login (${describe(check, "GET", "/user")})`);
+		throw new Error(describe(retry, method, path));
+	}
+
+	/**
+	 * send(), retrying what is worth retrying:
+	 *  - 429, or 403 for a rate limit: wait as long as GitHub says
+	 *  - 5xx and network failures: GitHub hiccups, retried after 2, 5, then 15 s
+	 * Every request we make is safe to repeat (GitHub stores content by its id,
+	 * and moving a branch to the same commit twice is harmless).
+	 */
+	private async sendWithRetries(token: string, method: string, path: string, body: unknown, accept: string): Promise<RequestUrlResponse> {
+		const backoff = [2, 5, 15];
+		let waits = 0;
+		let hiccups = 0;
+		for (;;) {
+			if (isOffline()) throw new NetworkError("Offline");
+			let res: RequestUrlResponse;
+			try {
+				res = await this.send(token, method, path, body, accept);
+			} catch (e) {
+				const why = `Couldn't reach GitHub for ${method} ${shortPath(path)}: ${e instanceof Error ? e.message : e}`;
+				// No point retrying while the device says it has no connection.
+				if (isOffline() || hiccups >= backoff.length) throw new NetworkError(why);
+				this.onNotice(`${why}; retrying in ${backoff[hiccups]} s (${hiccups + 1} of ${backoff.length})`);
+				await sleep(backoff[hiccups++]);
+				continue;
+			}
+			const wait = slowDownSeconds(res);
+			if (wait !== null) {
+				if (wait > 5 * 60 || waits >= 5) {
+					throw new Error(`${describe(res, method, path)}. GitHub's limit resets in about ${Math.ceil(wait / 60)} min; sync will resume then.`);
+				}
+				this.onNotice(`${describe(res, method, path)}; waiting ${wait} s as GitHub asks (${++waits} of 5)`);
+				await sleep(wait);
+				continue;
+			}
+			if (res.status >= 500 && hiccups < backoff.length) {
+				this.onNotice(`${describe(res, method, path)}; retrying in ${backoff[hiccups]} s (${hiccups + 1} of ${backoff.length})`);
+				await sleep(backoff[hiccups++]);
+				continue;
+			}
+			return res;
+		}
 	}
 
 	private send(token: string, method: string, path: string, body: unknown, accept: string): Promise<RequestUrlResponse> {
-		return requestUrl({
+		const request = requestUrl({
 			url: `${API}${path}`,
 			method,
 			headers: {
@@ -43,11 +91,17 @@ export class GitHub implements RemoteStore {
 			body: body === undefined ? undefined : JSON.stringify(body),
 			throw: false,
 		});
+		// requestUrl has no timeout of its own; a stuck request would hang the sync forever.
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const timeout = new Promise<never>((_, reject) => {
+			timer = setTimeout(() => reject(new Error(`no answer within ${REQUEST_TIMEOUT_S} s`)), REQUEST_TIMEOUT_S * 1000);
+		});
+		return Promise.race([request, timeout]).finally(() => clearTimeout(timer));
 	}
 
 	private async json(method: string, path: string, body?: unknown): Promise<any> {
 		const res = await this.call(method, path, body);
-		if (res.status >= 400) throw apiError(res);
+		if (res.status >= 400) throw apiError(res, method, path);
 		return res.json;
 	}
 
@@ -90,16 +144,21 @@ export class GitHub implements RemoteStore {
 	}
 
 	async getHead(branch: string): Promise<string> {
-		const res = await this.call("GET", this.r(`/git/ref/heads/${branch}`));
-		if (res.status === 404) throw new Error(`Branch "${branch}" not found in ${this.repo}`);
+		const path = this.r(`/git/ref/heads/${branch}`);
+		const res = await this.call("GET", path);
+		if (res.status === 404) throw new Error(`Branch "${branch}" not found in ${this.repo} (${describe(res, "GET", path)})`);
 		if (res.status === 409) throw new Error(`${this.repo} is empty. Add any file (a README is fine) on GitHub first.`);
-		if (res.status >= 400) throw apiError(res);
+		if (res.status >= 400) throw apiError(res, "GET", path);
 		return res.json.object.sha;
 	}
 
 	async getTree(commit: string): Promise<RemoteTree> {
 		const c = await this.json("GET", this.r(`/git/commits/${commit}`));
-		const t = await this.json("GET", this.r(`/git/trees/${c.tree.sha}?recursive=1`));
+		return { treeSha: c.tree.sha, entries: await this.listTree(c.tree.sha) };
+	}
+
+	async listTree(treeSha: string): Promise<Map<string, RemoteEntry>> {
+		const t = await this.json("GET", this.r(`/git/trees/${treeSha}?recursive=1`));
 		if (t.truncated) throw new Error("This repository has too many files for GitHub to list in one go");
 		const entries = new Map<string, RemoteEntry>();
 		for (const e of t.tree) {
@@ -108,12 +167,13 @@ export class GitHub implements RemoteStore {
 				entries.set(e.path, { sha: e.sha, mode: e.mode });
 			}
 		}
-		return { treeSha: c.tree.sha, entries };
+		return entries;
 	}
 
 	async getBlob(sha: string): Promise<Uint8Array> {
-		const res = await this.call("GET", this.r(`/git/blobs/${sha}`), undefined, "application/vnd.github.raw+json");
-		if (res.status >= 400) throw apiError(res);
+		const path = this.r(`/git/blobs/${sha}`);
+		const res = await this.call("GET", path, undefined, "application/vnd.github.raw+json");
+		if (res.status >= 400) throw apiError(res, "GET", path);
 		return new Uint8Array(res.arrayBuffer);
 	}
 
@@ -123,7 +183,11 @@ export class GitHub implements RemoteStore {
 	}
 
 	async createTree(baseTree: string, changes: TreeChange[]): Promise<string> {
-		const tree = changes.map((c) => ({ path: c.path, mode: c.mode, type: "blob", sha: c.sha }));
+		const tree = changes.map((c) =>
+			c.content !== undefined && c.sha !== null
+				? { path: c.path, mode: c.mode, type: "blob", content: c.content }
+				: { path: c.path, mode: c.mode, type: "blob", sha: c.sha },
+		);
 		return (await this.json("POST", this.r("/git/trees"), { base_tree: baseTree, tree })).sha;
 	}
 
@@ -132,29 +196,96 @@ export class GitHub implements RemoteStore {
 	}
 
 	async updateRef(branch: string, sha: string, force: boolean): Promise<boolean> {
-		const res = await this.call("PATCH", this.r(`/git/refs/heads/${branch}`), { sha, force });
+		const path = this.r(`/git/refs/heads/${branch}`);
+		const res = await this.call("PATCH", path, { sha, force });
 		if (res.status < 400) return true;
-		if (res.status === 422 && /does not exist/i.test(res.text)) {
-			await this.json("POST", this.r("/git/refs"), { ref: `refs/heads/${branch}`, sha });
-			return true;
+		if (res.status === 422 && /does not exist/i.test(messageOf(res))) {
+			const created = await this.call("POST", this.r("/git/refs"), { ref: `refs/heads/${branch}`, sha });
+			if (created.status < 400) return true;
+			// Created by a retried request a moment ago: just move it.
+			if (created.status === 422 && /already exists/i.test(messageOf(created))) return this.updateRef(branch, sha, force);
+			throw apiError(created, "POST", this.r("/git/refs"));
 		}
 		if (res.status === 422 && !force) return false;
-		throw apiError(res);
+		throw apiError(res, "PATCH", path);
+	}
+
+}
+
+const REQUEST_TIMEOUT_S = 120;
+
+const sleep = (seconds: number) => new Promise((r) => setTimeout(r, seconds * 1000));
+
+const STATUS_TEXT: Record<number, string> = {
+	400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found", 409: "Conflict",
+	413: "Too Large", 422: "Unprocessable", 429: "Too Many Requests", 500: "Internal Server Error",
+	502: "Bad Gateway", 503: "Service Unavailable", 504: "Gateway Timeout",
+};
+
+function header(res: RequestUrlResponse, name: string): string | undefined {
+	for (const [k, v] of Object.entries(res.headers ?? {})) if (k.toLowerCase() === name) return v;
+	return undefined;
+}
+
+function messageOf(res: RequestUrlResponse): string {
+	try {
+		return res.json?.message ?? "";
+	} catch {
+		return "";
 	}
 }
 
-function apiError(res: RequestUrlResponse): Error {
-	let msg = "";
+/** "/repos/me/vault/git/trees?recursive=1" -> "/git/trees" */
+function shortPath(path: string): string {
+	return path.split("?")[0].replace(/^\/repos\/[^/]+\/[^/]+/, "") || "/";
+}
+
+/**
+ * Everything useful GitHub said about a failed request, on one line:
+ * status, which request, GitHub's message and field errors (or the start of
+ * a non-JSON body), and GitHub's request id for support.
+ */
+export function describe(res: RequestUrlResponse, method: string, path: string): string {
+	let detail = "";
 	try {
-		msg = res.json?.message ?? "";
+		const j = res.json;
+		detail = j?.message ?? "";
+		if (Array.isArray(j?.errors) && j.errors.length) {
+			const errs = j.errors.map((e: any) => (typeof e === "string" ? e : e.message ?? [e.resource, e.field, e.code].filter(Boolean).join(" "))).join("; ");
+			detail += ` (${errs})`;
+		}
 	} catch {
-		/* not json */
+		try {
+			detail = res.text.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 200);
+		} catch {
+			/* no body */
+		}
 	}
-	if ((res.status === 403 || res.status === 429) && res.headers["x-ratelimit-remaining"] === "0") {
-		return new Error("GitHub rate limit reached; sync will resume within the hour");
+	const id = header(res, "x-github-request-id");
+	const status = `${res.status}${STATUS_TEXT[res.status] ? ` ${STATUS_TEXT[res.status]}` : ""}`;
+	return `GitHub ${status} on ${method} ${shortPath(path)}${detail ? `: ${detail}` : ""}${id ? ` [request ${id}]` : ""}`;
+}
+
+/** Seconds GitHub wants us to wait before retrying, or null if this isn't a "slow down" response. */
+function slowDownSeconds(res: RequestUrlResponse): number | null {
+	if (res.status !== 403 && res.status !== 429) return null;
+	const retryAfter = Number(header(res, "retry-after"));
+	if (retryAfter > 0) return retryAfter;
+	if (header(res, "x-ratelimit-remaining") === "0") {
+		const reset = Number(header(res, "x-ratelimit-reset"));
+		return reset ? Math.max(1, reset - Math.floor(Date.now() / 1000)) : 60;
 	}
-	if (res.status === 404) return new Error(`GitHub: not found (does the login have access to this repository?)`);
-	return new Error(`GitHub ${res.status}${msg ? `: ${msg}` : ""}`);
+	if (res.status === 429 || /rate limit/i.test(messageOf(res))) return 60;
+	return null;
+}
+
+function apiError(res: RequestUrlResponse, method: string, path: string): Error {
+	const what = describe(res, method, path);
+	if (res.status === 404) return new Error(`${what}. Does your sync app have access to this repository?`);
+	if (res.status === 403 && /not accessible by integration/i.test(messageOf(res))) {
+		return new Error(`${what}. Your sync app needs "Contents: Read and write" permission and access to this repository.`);
+	}
+	return new Error(what);
 }
 
 /*

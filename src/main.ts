@@ -1,6 +1,6 @@
 import { Notice, Platform, Plugin, TAbstractFile, TFile } from "obsidian";
 import { Change, emptyState, Mode, SyncEngine, SyncResult, SyncState } from "./engine";
-import { Auth, AuthError, Credentials } from "./auth";
+import { Auth, AuthError, Credentials, isOffline, NetworkError } from "./auth";
 import { GitHub } from "./github";
 import { InstallModal, LoginModal, PANEL_VIEW, RepoPicker, SettingsTab, SyncPanel } from "./ui";
 import { VaultStore } from "./vaultStore";
@@ -44,7 +44,7 @@ const DEFAULTS: Omit<Settings, "deviceName"> = {
 	appSlug: "",
 };
 
-export type Phase = "logged-out" | "no-repo" | "idle" | "syncing" | "error";
+export type Phase = "logged-out" | "no-repo" | "idle" | "syncing" | "offline" | "error";
 
 export interface Status {
 	phase: Phase;
@@ -145,6 +145,12 @@ export default class SimpleGitSync extends Plugin {
 			}),
 		);
 
+		// Back online: push whatever was edited meanwhile and pull what others did.
+		this.registerDomEvent(window, "online", () => this.schedule("full", 1000));
+		this.registerDomEvent(window, "offline", () => {
+			if (this.status.phase === "idle" || this.status.phase === "error") this.setPhase("offline", "");
+		});
+
 		// App sent to background (phone) or minimized: push now. Back in front: catch up.
 		this.registerDomEvent(document, "visibilitychange", () => {
 			if (document.visibilityState === "hidden") {
@@ -199,17 +205,26 @@ export default class SimpleGitSync extends Plugin {
 	async syncNow(mode: Mode) {
 		if (!this.loggedIn()) return this.login();
 		if (!this.settings.repo) return this.chooseRepo();
+		if (this.running) {
+			new Notice(`Git sync is already running${this.status.message ? ` (${this.status.message})` : ""}. It will sync again when it finishes.`);
+		}
 		await this.run(mode, true);
 	}
 
 	private async run(mode: Mode, manual = false): Promise<void> {
 		if (!this.loggedIn() || !this.settings.repo) return;
+		if (isOffline()) {
+			// Nothing to try; the "online" event starts a sync when the connection returns.
+			this.setPhase("offline", "");
+			if (manual) new Notice("You're offline. Changes will sync when you're back online.");
+			return;
+		}
 		if (this.running) {
 			if (this.rerun !== "full") this.rerun = mode;
 			return;
 		}
 		this.running = true;
-		this.setPhase("syncing", mode === "full" ? "Syncing…" : "Checking GitHub…");
+		this.setPhase("syncing", mode === "full" ? "syncing…" : "checking GitHub…");
 		const dirtyAtStart = new Set(this.dirty);
 		try {
 			const result = await this.getEngine().sync(mode);
@@ -217,6 +232,7 @@ export default class SimpleGitSync extends Plugin {
 			this.status.lastSync = new Date();
 			this.status.lastResult = result;
 			this.report(result, manual);
+			this.lastErrorShown = "";
 			this.setPhase("idle", "");
 		} catch (e) {
 			const msg = e instanceof Error ? e.message : String(e);
@@ -225,9 +241,15 @@ export default class SimpleGitSync extends Plugin {
 			await this.save().catch(() => {});
 			if (e instanceof AuthError) {
 				this.loginExpired(msg);
+			} else if (e instanceof NetworkError) {
+				// Offline or no signal: not an error. The next trigger or the "online" event retries.
+				this.setPhase("offline", msg);
+				if (manual) new Notice(`Can't reach GitHub right now (${msg}). Changes will sync when the connection is back.`);
 			} else {
 				this.setPhase("error", msg);
-				if (manual) new Notice(`Git sync failed: ${msg}`);
+				// Show each new problem once, even for background syncs.
+				if (manual || msg !== this.lastErrorShown) new Notice(`Git sync failed: ${msg}`, 15000);
+				this.lastErrorShown = msg;
 			}
 		} finally {
 			this.running = false;
@@ -270,7 +292,13 @@ export default class SimpleGitSync extends Plugin {
 		);
 		const branch = this.branch();
 		const device = this.settings.deviceName.replace(/[^A-Za-z0-9._-]+/g, "-") || "device";
-		this.engine = new SyncEngine(store, new GitHub(this.auth, this.settings.repo), {
+		const github = new GitHub(this.auth, this.settings.repo, (notice) => {
+			// Full detail in the activity log; a short version in the status line.
+			this.addLog(notice);
+			const wait = /waiting (\d+) s/.exec(notice);
+			this.progress(wait ? `GitHub asked to wait ${wait[1]} s` : "GitHub hiccup, retrying");
+		});
+		this.engine = new SyncEngine(store, github, {
 			branch,
 			deviceName: device,
 			deviceBranch: this.settings.useDeviceBranch ? `sync/${device}` : null,
@@ -281,6 +309,7 @@ export default class SimpleGitSync extends Plugin {
 				return c ? [c.access, c.refresh ?? ""] : [];
 			},
 			log: (m) => this.addLog(m),
+			progress: (m) => this.progress(m),
 		});
 		return this.engine;
 	}
@@ -406,7 +435,24 @@ export default class SimpleGitSync extends Plugin {
 		this.refresh();
 	}
 
+	private lastProgress = 0;
+	private lastErrorShown = "";
+
+	/** Show what a long sync is doing, without redrawing the panel on every file. */
+	private progress(message: string) {
+		if (this.status.phase !== "syncing") return;
+		this.status.message = message;
+		if (Date.now() - this.lastProgress < 500) return;
+		this.lastProgress = Date.now();
+		this.refresh();
+	}
+
 	private addLog(text: string) {
+		// Repeats (e.g. the same error every minute) update the time instead of filling the log.
+		if (this.status.log[0]?.text === text) {
+			this.status.log[0].at = new Date();
+			return;
+		}
 		this.status.log.unshift({ at: new Date(), text });
 		this.status.log.length = Math.min(this.status.log.length, 40);
 	}
@@ -453,7 +499,8 @@ export function statusLine(p: SimpleGitSync): string {
 	switch (p.status.phase) {
 		case "logged-out": return "Git: not logged in";
 		case "no-repo": return "Git: choose a repository";
-		case "syncing": return "Git: syncing…";
+		case "syncing": return `Git: ${p.status.message || "syncing…"}`;
+		case "offline": return `Git: offline${p.dirtyCount() ? ` · ${p.dirtyCount()} unpushed` : ""}`;
 		case "error": return "Git: sync error";
 		default: return `Git: synced ${ago(p.status.lastSync)}${p.dirtyCount() ? ` · ${p.dirtyCount()} unpushed` : ""}`;
 	}

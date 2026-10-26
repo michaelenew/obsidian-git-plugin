@@ -4,7 +4,7 @@ import { emptyState, LocalEntry, LocalStore, RemoteStore, RemoteTree, SyncEngine
 import { gitBlobSha } from "../src/sha";
 
 const enc = (s: string) => new TextEncoder().encode(s);
-const dec = (b: Uint8Array) => new TextDecoder().decode(b);
+const dec = (b: Uint8Array) => new TextDecoder("utf-8", { ignoreBOM: true }).decode(b);
 
 /** A fake GitHub: blobs, flat trees and commits held in memory. */
 class FakeGitHub implements RemoteStore {
@@ -13,12 +13,16 @@ class FakeGitHub implements RemoteStore {
 	commits = new Map<string, { tree: string; parents: string[]; message: string }>();
 	refs = new Map<string, string>();
 	private n = 0;
+	blobUploads = 0;
+	treeCalls = 0;
+	/** Simulates GitHub storing inline text differently from what was sent. */
+	mangle: ((s: string) => string) | null = null;
 	/** Called right before main is moved, to simulate another writer racing us. */
 	beforeMainUpdate: (() => Promise<void>) | null = null;
 
 	async seed(files: Record<string, string>, message = "seed") {
 		const entries = new Map<string, { sha: string; mode: string }>();
-		for (const [p, c] of Object.entries(files)) entries.set(p, { sha: await this.createBlob(enc(c)), mode: "100644" });
+		for (const [p, c] of Object.entries(files)) entries.set(p, { sha: await this.storeBlob(enc(c)), mode: "100644" });
 		const tree = `t${this.n++}`;
 		this.trees.set(tree, entries);
 		const parent = this.refs.get("main");
@@ -32,7 +36,7 @@ class FakeGitHub implements RemoteStore {
 		const current = new Map(this.trees.get(this.commits.get(this.refs.get("main")!)!.tree)!);
 		for (const [p, c] of Object.entries(changes)) {
 			if (c === null) current.delete(p);
-			else current.set(p, { sha: await this.createBlob(enc(c)), mode: "100644" });
+			else current.set(p, { sha: await this.storeBlob(enc(c)), mode: "100644" });
 		}
 		const tree = `t${this.n++}`;
 		this.trees.set(tree, current);
@@ -61,19 +65,33 @@ class FakeGitHub implements RemoteStore {
 		return this.blobs.get(sha)!;
 	}
 	async createBlob(data: Uint8Array) {
+		this.blobUploads++;
+		return this.storeBlob(data);
+	}
+	async storeBlob(data: Uint8Array) {
 		const sha = await gitBlobSha(data);
 		this.blobs.set(sha, data);
 		return sha;
 	}
 	async createTree(baseTree: string, changes: TreeChange[]) {
+		this.treeCalls++;
 		const entries = new Map(this.trees.get(baseTree)!);
 		for (const c of changes) {
 			if (c.sha === null) entries.delete(c.path);
-			else entries.set(c.path, { sha: c.sha, mode: c.mode });
+			else if (c.content !== undefined) {
+				const text = this.mangle ? this.mangle(c.content) : c.content;
+				entries.set(c.path, { sha: await this.storeBlob(enc(text)), mode: c.mode });
+			} else {
+				if (!this.blobs.has(c.sha)) throw new Error(`tree refers to missing blob for ${c.path}`);
+				entries.set(c.path, { sha: c.sha, mode: c.mode });
+			}
 		}
 		const tree = `t${this.n++}`;
 		this.trees.set(tree, entries);
 		return tree;
+	}
+	async listTree(treeSha: string) {
+		return new Map(this.trees.get(treeSha)!);
 	}
 	async createCommit(message: string, tree: string, parents: string[]) {
 		const commit = `c${this.n++}`;
@@ -312,4 +330,60 @@ test("refuses a mass delete caused by an empty scan", async () => {
 	disk.files.clear();
 	await assert.rejects(engine.sync("full"), /Refusing to delete 40/);
 	assert.equal(Object.keys(gh.files()).length, 40);
+});
+
+test("a big first upload sends text inside a few tree requests, and only binaries one by one", async () => {
+	const gh = new FakeGitHub();
+	await gh.seed({ "README.md": "hi" });
+	const { disk, engine } = device(gh, "mac");
+	for (let i = 0; i < 1200; i++) disk.put(`notes/n${i}.md`, `note ${i}\n`);
+	disk.files.set("pic.png", { data: new Uint8Array([0x89, 0x50, 0xff, 0x00, 0xfe]), mtime: 0 });
+	disk.put("bom.md", "\ufeffstarts with a BOM");
+	const progress: string[] = [];
+	(engine as any).opts.progress = (m: string) => progress.push(m);
+	const r = await engine.sync("full");
+	assert.equal(r.pushed.length, 1202);
+	assert.equal(gh.blobUploads, 1, "only the binary file is uploaded on its own");
+	assert.equal(gh.treeCalls, 3, "1201 text files in batches of 500");
+	const files = gh.files();
+	assert.equal(files["notes/n1199.md"], "note 1199\n");
+	assert.equal(files["bom.md"], "\ufeffstarts with a BOM");
+	assert.ok(progress.includes("uploading 1202 of 1202"));
+});
+
+test("if GitHub stores inline text differently, those files are re-sent byte-for-byte", async () => {
+	const gh = new FakeGitHub();
+	await gh.seed({ "README.md": "hi" });
+	const { disk, engine } = device(gh, "mac");
+	disk.put("crlf.md", "line one\r\nline two\r\n");
+	disk.put("plain.md", "plain\n");
+	gh.mangle = (s) => s.replace(/\r\n/g, "\n");
+	await engine.sync("full");
+	assert.equal(gh.files()["crlf.md"], "line one\r\nline two\r\n");
+	assert.equal(gh.files()["plain.md"], "plain\n");
+	assert.equal(gh.blobUploads, 1);
+});
+
+test("losing the connection mid-download stops cleanly and the next sync finishes the job", async () => {
+	const gh = new FakeGitHub();
+	const files: Record<string, string> = {};
+	for (let i = 0; i < 30; i++) files[`n${i}.md`] = `note ${i}`;
+	await gh.seed(files);
+	const { disk, engine } = device(gh, "phone");
+	const getBlob = gh.getBlob.bind(gh);
+	let calls = 0;
+	gh.getBlob = async (sha) => {
+		if (++calls === 10) throw new Error("network down");
+		return getBlob(sha);
+	};
+	await assert.rejects(engine.sync("full"), /network down/);
+	const written = disk.files.size;
+	await new Promise((r) => setTimeout(r, 10));
+	assert.equal(disk.files.size, written, "nothing keeps writing after the sync reported failure");
+	assert.ok(written < 30);
+
+	disk.put("offline-edit.md", "written while offline");
+	await engine.sync("full");
+	assert.equal(disk.files.size, 31);
+	assert.equal(gh.files()["offline-edit.md"], "written while offline");
 });
