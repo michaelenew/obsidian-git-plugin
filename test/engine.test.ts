@@ -1,0 +1,315 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { emptyState, LocalEntry, LocalStore, RemoteStore, RemoteTree, SyncEngine, TreeChange } from "../src/engine";
+import { gitBlobSha } from "../src/sha";
+
+const enc = (s: string) => new TextEncoder().encode(s);
+const dec = (b: Uint8Array) => new TextDecoder().decode(b);
+
+/** A fake GitHub: blobs, flat trees and commits held in memory. */
+class FakeGitHub implements RemoteStore {
+	blobs = new Map<string, Uint8Array>();
+	trees = new Map<string, Map<string, { sha: string; mode: string }>>();
+	commits = new Map<string, { tree: string; parents: string[]; message: string }>();
+	refs = new Map<string, string>();
+	private n = 0;
+	/** Called right before main is moved, to simulate another writer racing us. */
+	beforeMainUpdate: (() => Promise<void>) | null = null;
+
+	async seed(files: Record<string, string>, message = "seed") {
+		const entries = new Map<string, { sha: string; mode: string }>();
+		for (const [p, c] of Object.entries(files)) entries.set(p, { sha: await this.createBlob(enc(c)), mode: "100644" });
+		const tree = `t${this.n++}`;
+		this.trees.set(tree, entries);
+		const parent = this.refs.get("main");
+		const commit = `c${this.n++}`;
+		this.commits.set(commit, { tree, parents: parent ? [parent] : [], message });
+		this.refs.set("main", commit);
+	}
+
+	/** Another writer (an agent, another device) edits main directly. */
+	async edit(changes: Record<string, string | null>) {
+		const current = new Map(this.trees.get(this.commits.get(this.refs.get("main")!)!.tree)!);
+		for (const [p, c] of Object.entries(changes)) {
+			if (c === null) current.delete(p);
+			else current.set(p, { sha: await this.createBlob(enc(c)), mode: "100644" });
+		}
+		const tree = `t${this.n++}`;
+		this.trees.set(tree, current);
+		const commit = `c${this.n++}`;
+		this.commits.set(commit, { tree, parents: [this.refs.get("main")!], message: "edit" });
+		this.refs.set("main", commit);
+	}
+
+	files(branch = "main"): Record<string, string> {
+		const tree = this.trees.get(this.commits.get(this.refs.get(branch)!)!.tree)!;
+		const out: Record<string, string> = {};
+		for (const [p, e] of tree) out[p] = dec(this.blobs.get(e.sha)!);
+		return out;
+	}
+
+	async getHead(branch: string) {
+		const h = this.refs.get(branch);
+		if (!h) throw new Error("no branch");
+		return h;
+	}
+	async getTree(commit: string): Promise<RemoteTree> {
+		const treeSha = this.commits.get(commit)!.tree;
+		return { treeSha, entries: new Map(this.trees.get(treeSha)!) };
+	}
+	async getBlob(sha: string) {
+		return this.blobs.get(sha)!;
+	}
+	async createBlob(data: Uint8Array) {
+		const sha = await gitBlobSha(data);
+		this.blobs.set(sha, data);
+		return sha;
+	}
+	async createTree(baseTree: string, changes: TreeChange[]) {
+		const entries = new Map(this.trees.get(baseTree)!);
+		for (const c of changes) {
+			if (c.sha === null) entries.delete(c.path);
+			else entries.set(c.path, { sha: c.sha, mode: c.mode });
+		}
+		const tree = `t${this.n++}`;
+		this.trees.set(tree, entries);
+		return tree;
+	}
+	async createCommit(message: string, tree: string, parents: string[]) {
+		const commit = `c${this.n++}`;
+		this.commits.set(commit, { tree, parents, message });
+		return commit;
+	}
+	async updateRef(branch: string, sha: string, force: boolean) {
+		if (branch === "main" && this.beforeMainUpdate) {
+			const f = this.beforeMainUpdate;
+			this.beforeMainUpdate = null;
+			await f();
+		}
+		const cur = this.refs.get(branch);
+		if (!force && cur && !this.commits.get(sha)!.parents.includes(cur)) return false;
+		this.refs.set(branch, sha);
+		return true;
+	}
+}
+
+class FakeDisk implements LocalStore {
+	files = new Map<string, { data: Uint8Array; mtime: number }>();
+	trashed: string[] = [];
+	private clock = 1;
+	excluded: (p: string) => boolean = (p) => p.startsWith(".obsidian/") || p.startsWith("code/");
+
+	put(path: string, content: string) {
+		this.files.set(path, { data: enc(content), mtime: this.clock++ });
+	}
+	get(path: string) {
+		const f = this.files.get(path);
+		return f ? dec(f.data) : undefined;
+	}
+	async list(): Promise<LocalEntry[]> {
+		return [...this.files]
+			.filter(([p]) => !this.excluded(p))
+			.map(([path, f]) => ({ path, mtime: f.mtime, size: f.data.length }));
+	}
+	async read(path: string) {
+		return this.files.get(path)!.data;
+	}
+	async write(path: string, data: Uint8Array) {
+		this.files.set(path, { data, mtime: this.clock++ });
+	}
+	async remove(path: string) {
+		this.trashed.push(path);
+		this.files.delete(path);
+	}
+	async exists(path: string) {
+		return this.files.has(path);
+	}
+	isExcluded(path: string) {
+		return this.excluded(path);
+	}
+}
+
+function device(gh: FakeGitHub, name: string, disk = new FakeDisk()) {
+	const state = emptyState("x");
+	const engine = new SyncEngine(disk, gh, {
+		branch: "main",
+		deviceName: name,
+		deviceBranch: `sync/${name}`,
+		state,
+		saveState: async () => {},
+		forbidden: () => ["gho_SECRETTOKEN123"],
+		now: () => new Date(2026, 9, 26, 14, 30),
+	});
+	return { disk, engine, state };
+}
+
+test("first sync downloads everything, ignoring excluded paths", async () => {
+	const gh = new FakeGitHub();
+	await gh.seed({ "a.md": "A", "dir/b.md": "B", "code/x.md": "nested repo file" });
+	const { disk, engine } = device(gh, "phone");
+	const r = await engine.sync("full");
+	assert.deepEqual(r.pulled.sort(), ["a.md", "dir/b.md"]);
+	assert.equal(disk.get("a.md"), "A");
+	assert.equal(disk.get("code/x.md"), undefined);
+	assert.equal(r.commit, null);
+});
+
+test("first sync with existing local files uploads them and keeps both on clash", async () => {
+	const gh = new FakeGitHub();
+	await gh.seed({ "same.md": "S", "clash.md": "remote" });
+	const { disk, engine } = device(gh, "mac");
+	disk.put("same.md", "S");
+	disk.put("clash.md", "local");
+	disk.put("new.md", "N");
+	const r = await engine.sync("full");
+	const files = gh.files();
+	assert.equal(files["new.md"], "N");
+	assert.equal(files["clash.md"], "local");
+	assert.equal(files["clash (conflict 2026-10-26 1430).md"], "remote");
+	assert.deepEqual(r.conflicts, ["clash (conflict 2026-10-26 1430).md"]);
+	assert.equal(gh.refs.get("sync/mac"), gh.refs.get("main"));
+});
+
+test("edits travel phone -> GitHub -> laptop, with one commit listing the files", async () => {
+	const gh = new FakeGitHub();
+	await gh.seed({ "a.md": "A" });
+	const phone = device(gh, "phone");
+	const mac = device(gh, "mac");
+	await phone.engine.sync("full");
+	await mac.engine.sync("full");
+
+	phone.disk.put("a.md", "A edited");
+	phone.disk.put("img.png", "\x89PNG binary");
+	const r = await phone.engine.sync("full");
+	assert.deepEqual(r.pushed, [{ path: "a.md", kind: "modified" }, { path: "img.png", kind: "added" }]);
+	const msg = gh.commits.get(r.commit!)!.message;
+	assert.match(msg, /^phone: a\.md, img\.png\n\nmodified: a\.md\nadded: img\.png/);
+
+	const p = await mac.engine.sync("pull");
+	assert.deepEqual(p.pulled.sort(), ["a.md", "img.png"]);
+	assert.equal(mac.disk.get("a.md"), "A edited");
+});
+
+test("pull with nothing new costs one request", async () => {
+	const gh = new FakeGitHub();
+	await gh.seed({ "a.md": "A" });
+	const { engine } = device(gh, "phone");
+	await engine.sync("full");
+	let treeCalls = 0;
+	const orig = gh.getTree.bind(gh);
+	gh.getTree = async (c) => (treeCalls++, orig(c));
+	await engine.sync("pull");
+	await engine.sync("pull");
+	assert.equal(treeCalls, 0);
+});
+
+test("edits to different lines of the same note merge cleanly", async () => {
+	const gh = new FakeGitHub();
+	await gh.seed({ "n.md": "one\ntwo\nthree\n" });
+	const { disk, engine } = device(gh, "phone");
+	await engine.sync("full");
+	disk.put("n.md", "ONE\ntwo\nthree\n");
+	await gh.edit({ "n.md": "one\ntwo\nTHREE\n" });
+	const r = await engine.sync("full");
+	assert.deepEqual(r.merged, ["n.md"]);
+	assert.equal(disk.get("n.md"), "ONE\ntwo\nTHREE\n");
+	assert.equal(gh.files()["n.md"], "ONE\ntwo\nTHREE\n");
+});
+
+test("edits to the same line keep both versions inside markers", async () => {
+	const gh = new FakeGitHub();
+	await gh.seed({ "n.md": "one\ntwo\n" });
+	const { disk, engine } = device(gh, "phone");
+	await engine.sync("full");
+	disk.put("n.md", "one\nphone\n");
+	await gh.edit({ "n.md": "one\nagent\n" });
+	const r = await engine.sync("full");
+	assert.deepEqual(r.conflicts, ["n.md"]);
+	const text = gh.files()["n.md"];
+	assert.ok(text.includes("phone") && text.includes("agent") && text.includes("<<<<<<< phone (this device)"));
+	assert.equal(disk.get("n.md"), text);
+});
+
+test("pull mode leaves files changed on both sides alone", async () => {
+	const gh = new FakeGitHub();
+	await gh.seed({ "n.md": "base", "other.md": "o" });
+	const { disk, engine } = device(gh, "mac");
+	await engine.sync("full");
+	disk.put("n.md", "typing...");
+	await gh.edit({ "n.md": "remote", "other.md": "o2" });
+	const r = await engine.sync("pull");
+	assert.deepEqual(r.skipped, ["n.md"]);
+	assert.deepEqual(r.pulled, ["other.md"]);
+	assert.equal(disk.get("n.md"), "typing...");
+	assert.equal(r.commit, null);
+	// And a pull right after does not short-circuit past the unsettled file.
+	const r2 = await engine.sync("pull");
+	assert.deepEqual(r2.skipped, ["n.md"]);
+});
+
+test("deletes propagate both ways; delete-vs-edit keeps the edit", async () => {
+	const gh = new FakeGitHub();
+	await gh.seed({ "gone-here.md": "1", "gone-there.md": "2", "del-vs-edit.md": "3", "edit-vs-del.md": "4" });
+	const { disk, engine } = device(gh, "phone");
+	await engine.sync("full");
+	disk.files.delete("gone-here.md");
+	disk.files.delete("del-vs-edit.md");
+	disk.put("edit-vs-del.md", "4 edited here");
+	await gh.edit({ "gone-there.md": null, "del-vs-edit.md": "3 edited there", "edit-vs-del.md": null });
+	await engine.sync("full");
+	const files = gh.files();
+	assert.equal(files["gone-here.md"], undefined);
+	assert.equal(disk.get("gone-there.md"), undefined);
+	assert.deepEqual(disk.trashed, ["gone-there.md"]);
+	assert.equal(disk.get("del-vs-edit.md"), "3 edited there");
+	assert.equal(files["edit-vs-del.md"], "4 edited here");
+});
+
+test("if main moves mid-push, it retries on top and loses nothing", async () => {
+	const gh = new FakeGitHub();
+	await gh.seed({ "a.md": "A", "b.md": "B" });
+	const { disk, engine } = device(gh, "phone");
+	await engine.sync("full");
+	disk.put("a.md", "A phone");
+	gh.beforeMainUpdate = () => gh.edit({ "b.md": "B agent" });
+	await engine.sync("full");
+	assert.deepEqual(gh.files(), { "a.md": "A phone", "b.md": "B agent" });
+	assert.equal(disk.get("b.md"), "B agent");
+});
+
+test("excluded paths are never uploaded or deleted, even if they were synced before", async () => {
+	const gh = new FakeGitHub();
+	await gh.seed({ "a.md": "A", "code/readme.md": "from before" });
+	const { disk, engine, state } = device(gh, "phone");
+	disk.excluded = () => false;
+	await engine.sync("full");
+	assert.ok(state.base["code/readme.md"]);
+	disk.excluded = (p) => p.startsWith("code/");
+	disk.files.delete("code/readme.md");
+	disk.put("code/.git/config", "secret stuff");
+	await engine.sync("full");
+	assert.equal(gh.files()["code/readme.md"], "from before");
+	assert.equal(gh.files()["code/.git/config"], undefined);
+});
+
+test("refuses to upload a file containing the login token", async () => {
+	const gh = new FakeGitHub();
+	await gh.seed({ "a.md": "A" });
+	const { disk, engine } = device(gh, "phone");
+	await engine.sync("full");
+	disk.put("leak.md", "oops gho_SECRETTOKEN123");
+	await assert.rejects(engine.sync("full"), /login token/);
+	assert.equal(gh.files()["leak.md"], undefined);
+});
+
+test("refuses a mass delete caused by an empty scan", async () => {
+	const gh = new FakeGitHub();
+	const many: Record<string, string> = {};
+	for (let i = 0; i < 40; i++) many[`n${i}.md`] = `${i}`;
+	await gh.seed(many);
+	const { disk, engine } = device(gh, "phone");
+	await engine.sync("full");
+	disk.files.clear();
+	await assert.rejects(engine.sync("full"), /Refusing to delete 40/);
+	assert.equal(Object.keys(gh.files()).length, 40);
+});

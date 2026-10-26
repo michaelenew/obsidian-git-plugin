@@ -1,0 +1,51 @@
+# Every push to main (i.e. every merge) publishes a release, which is what
+# BRAT and Obsidian install from: the built main.js plus manifest.json and
+# styles.css attached to a version-numbered GitHub release.
+#
+# Version = major.minor from manifest.json + this workflow's run number, so
+# each merge gets a higher version and devices pick it up as an update.
+# Bump major/minor in manifest.json by hand when you want to.
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - name: Stamp version
+        id: version
+        run: |
+          version=$(node -e '
+            const fs = require("fs");
+            const m = JSON.parse(fs.readFileSync("manifest.json", "utf8"));
+            const [major, minor] = m.version.split(".");
+            m.version = `${major}.${minor}.${process.env.GITHUB_RUN_NUMBER}`;
+            fs.writeFileSync("manifest.json", JSON.stringify(m, null, 2) + "\n");
+            console.log(m.version);
+          ')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh release create "$VERSION" main.js manifest.json styles.css \
+            --title "$VERSION" --target "$GITHUB_SHA" --latest \
+            --notes "$(git log -1 --format=%B)"
