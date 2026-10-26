@@ -338,7 +338,7 @@ export class SyncEngine {
 				result.pushed.push({ path, kind: a.kind });
 				this.log(`pushed ${head.commit.slice(0, 7)} (attachment ${path}, ${size})`);
 			} catch (e) {
-				if (e instanceof Error && e.name === "AuthError") throw e;
+				if (e instanceof Error && (e.name === "AuthError" || e.name === "StoppedError")) throw e;
 				// A dropped connection or timeout: if GitHub still answers, it was this file, not the connection.
 				if (e instanceof Error && e.name === "NetworkError") {
 					await this.remote.getHead(this.opts.branch).catch(() => {

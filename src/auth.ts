@@ -9,6 +9,11 @@ export class NetworkError extends Error {
 	name = "NetworkError";
 }
 
+/** This copy of the plugin was unloaded (updated or turned off); its leftover work must stop. */
+export class StoppedError extends Error {
+	name = "StoppedError";
+}
+
 export function isOffline(): boolean {
 	return typeof navigator !== "undefined" && navigator.onLine === false;
 }
@@ -70,6 +75,7 @@ export function credentialsFrom(j: any): Credentials {
 /** Hands out a working access token, refreshing it when needed. */
 export class Auth {
 	private refreshing: Promise<string> | null = null;
+	private stopped = false;
 
 	constructor(
 		private load: () => Credentials | null,
@@ -78,7 +84,17 @@ export class Auth {
 		private onRenew: (c: Credentials) => void = () => {},
 	) {}
 
+	/**
+	 * Called when the plugin unloads. A sync already in flight keeps running in the
+	 * background; from now on it gets no token, so it can't push, renew (using up the
+	 * single-use renewal token the new copy relies on), or change the stored login.
+	 */
+	stop() {
+		this.stopped = true;
+	}
+
 	async accessToken(): Promise<string> {
+		if (this.stopped) throw new StoppedError("Stopped: this copy of the plugin was unloaded");
 		const c = this.load();
 		if (!c) throw new AuthError("Not logged in to GitHub");
 		if (c.expiresAt && Date.now() > c.expiresAt - EARLY_MS) return this.refresh(c);
@@ -87,6 +103,7 @@ export class Auth {
 
 	/** GitHub rejected `rejected`; get a new token or throw AuthError. */
 	async renew(rejected: string): Promise<string> {
+		if (this.stopped) throw new StoppedError("Stopped: this copy of the plugin was unloaded");
 		const c = this.load();
 		if (!c) throw new AuthError("Not logged in to GitHub");
 		// Another request already refreshed while this one was in flight.
@@ -119,6 +136,7 @@ export class Auth {
 			throw new AuthError(`GitHub refused to renew the login: ${j.error_description ?? j.error ?? "no reason given"}${j.error ? ` (${j.error})` : ""}`);
 		}
 		const next = credentialsFrom(j);
+		if (this.stopped) throw new StoppedError("Stopped: this copy of the plugin was unloaded");
 		this.store(next);
 		this.onRenew(next);
 		return next.access;
