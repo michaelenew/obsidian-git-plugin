@@ -28,7 +28,13 @@ export class GitHub implements RemoteStore {
 		// GitHub sometimes answers one request with 401 while the login is fine. Renewing then
 		// would only churn the single-use renewal token, so first check the login itself.
 		const check = await this.sendWithRetries(token, "GET", "/user", undefined, "application/vnd.github+json");
-		if (check.status !== 401) throw new Error(`${describe(res, method, path)} (the login itself still works)`);
+		if (check.status !== 401) {
+			// Seen on uploads of a few MB: the same request with the same login works the second time.
+			this.onNotice(`${describe(res, method, path)}, but the login itself works; retrying once`);
+			const again = await this.sendWithRetries(token, method, path, body, accept);
+			if (again.status !== 401) return again;
+			throw new Error(`${describe(again, method, path)} (twice, though the login itself works)`);
+		}
 		this.onNotice(`${describe(check, "GET", "/user")}; renewing the login`);
 		const fresh = await this.auth.renew(token);
 		const retry = await this.sendWithRetries(fresh, method, path, body, accept);
