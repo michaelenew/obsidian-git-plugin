@@ -1,14 +1,22 @@
-# Builds the plugin and publishes a GitHub release that BRAT (and Obsidian)
-# can install from. Run it from the Actions tab, or push a tag like 0.1.0.
+# Every push to main (i.e. every merge) publishes a release, which is what
+# BRAT and Obsidian install from: the built main.js plus manifest.json and
+# styles.css attached to a version-numbered GitHub release.
+#
+# Version = major.minor from manifest.json + this workflow's run number, so
+# each merge gets a higher version and devices pick it up as an update.
+# Bump major/minor in manifest.json by hand when you want to.
 name: Release
 
 on:
-  workflow_dispatch:
   push:
-    tags: ["*"]
+    branches: [main]
 
 permissions:
   contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
   release:
@@ -21,13 +29,23 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npm run build
+      - name: Stamp version
+        id: version
+        run: |
+          version=$(node -e '
+            const fs = require("fs");
+            const m = JSON.parse(fs.readFileSync("manifest.json", "utf8"));
+            const [major, minor] = m.version.split(".");
+            m.version = `${major}.${minor}.${process.env.GITHUB_RUN_NUMBER}`;
+            fs.writeFileSync("manifest.json", JSON.stringify(m, null, 2) + "\n");
+            console.log(m.version);
+          ')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          version=$(node -p "require('./manifest.json').version")
-          if gh release view "$version" >/dev/null 2>&1; then
-            gh release upload "$version" main.js manifest.json styles.css --clobber
-          else
-            gh release create "$version" main.js manifest.json styles.css --title "$version" --notes "Simple Git Sync $version" --target "$GITHUB_SHA"
-          fi
+          gh release create "$VERSION" main.js manifest.json styles.css \
+            --title "$VERSION" --target "$GITHUB_SHA" --latest \
+            --notes "$(git log -1 --format=%B)"

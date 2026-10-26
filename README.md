@@ -104,6 +104,6 @@ npm run build   # main.js
 npm run dev     # rebuild on change
 ```
 
-To release: bump `version` in `manifest.json` and `package.json` (and add it to `versions.json`), then run the **Release** workflow from the Actions tab.
+Releases are automatic: every merge to `main` builds the plugin and publishes a GitHub release (version `major.minor` from `manifest.json` plus a build number), which BRAT installs as an update. Change `major.minor` in `manifest.json` only when you want to.
 
 Code map: `src/engine.ts` decides what to download, merge and upload; `src/github.ts` is the GitHub API and login; `src/vaultStore.ts` reads and writes the vault and applies the skip rules; `src/main.ts` wires up the triggers; `src/ui.ts` is the panel, login window and settings.
