@@ -97,6 +97,8 @@ export interface SyncResult {
 	conflicts: string[];
 	/** remote changes held back because the local file changed mid-sync or (pull mode) also changed locally */
 	skipped: string[];
+	/** Files GitHub wouldn't take this time; everything else was synced. Retried next sync. */
+	failed: Array<{ path: string; error: string }>;
 }
 
 export interface EngineOptions {
@@ -171,7 +173,7 @@ export class SyncEngine {
 	private async attempt(mode: Mode): Promise<SyncResult | null> {
 		const head = await this.remote.getHead(this.opts.branch);
 		const result: SyncResult = {
-			mode, head, commit: null, pulled: [], pushed: [], merged: [], conflicts: [], skipped: [],
+			mode, head, commit: null, pulled: [], pushed: [], merged: [], conflicts: [], skipped: [], failed: [],
 		};
 		if (mode === "pull" && head === this.settledHead) return result;
 
@@ -263,7 +265,7 @@ export class SyncEngine {
 			CONCURRENCY,
 		);
 
-		const changes = mode === "full" && toPush.size > 0 ? await this.prepareUpload(toPush, remote) : [];
+		const changes = mode === "full" && toPush.size > 0 ? await this.prepareUpload(toPush, remote, result) : [];
 		if (changes.length === 0) {
 			this.state.lastCommit = head;
 			this.settledHead = settled ? head : null;
@@ -296,6 +298,7 @@ export class SyncEngine {
 	private async prepareUpload(
 		paths: Set<string>,
 		remote: Map<string, RemoteEntry>,
+		result: SyncResult,
 	): Promise<Array<{ change: TreeChange; kind: ChangeKind }>> {
 		const out: Array<{ change: TreeChange; kind: ChangeKind }> = [];
 		const blobs: Array<{ change: TreeChange; data: Uint8Array }> = [];
@@ -327,13 +330,24 @@ export class SyncEngine {
 		);
 
 		let uploaded = 0;
+		const failed = new Set<string>();
 		await runLimited(
 			blobs.map(({ change, data }) => async () => {
 				this.opts.progress?.(`uploading file ${++uploaded} of ${blobs.length}`);
-				await this.uploadBlob(change.path, data, change.sha!);
+				try {
+					await this.uploadBlob(change.path, data, change.sha!);
+				} catch (e) {
+					// Offline or logged out: stop. Anything else is about this one file: sync the rest.
+					if (e instanceof Error && (e.name === "NetworkError" || e.name === "AuthError")) throw e;
+					const error = `Uploading "${change.path}" (${formatSize(data.length)}) failed: ${e instanceof Error ? e.message : e}`;
+					this.log(error);
+					result.failed.push({ path: change.path, error });
+					failed.add(change.path);
+				}
 			}),
 			BLOB_CONCURRENCY,
 		);
+		if (failed.size) out.splice(0, out.length, ...out.filter((c) => !failed.has(c.change.path)));
 
 		// A scan that silently missed files would look like a mass delete; refuse that.
 		const deleted = out.filter((c) => c.kind === "deleted").length;
@@ -474,6 +488,12 @@ export class SyncEngine {
 		this.state.shaCache = fresh;
 		return out;
 	}
+}
+
+function formatSize(bytes: number): string {
+	if (bytes < 1024) return `${bytes} B`;
+	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+	return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
 /** The file as text, if it is UTF-8 that converts back to exactly the same bytes. */

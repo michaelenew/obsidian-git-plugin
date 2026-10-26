@@ -387,3 +387,42 @@ test("losing the connection mid-download stops cleanly and the next sync finishe
 	assert.equal(disk.files.size, 31);
 	assert.equal(gh.files()["offline-edit.md"], "written while offline");
 });
+
+test("a file GitHub refuses is reported and retried later; everything else still syncs", async () => {
+	const gh = new FakeGitHub();
+	await gh.seed({ "README.md": "hi" });
+	const { disk, engine, state } = device(gh, "mac");
+	disk.put("note.md", "text");
+	disk.files.set("big.pdf", { data: new Uint8Array([0xff, 0xfe, 0x00, 1, 2, 3]), mtime: 0 });
+	disk.files.set("small.png", { data: new Uint8Array([0x89, 0x00, 0xff]), mtime: 0 });
+	const createBlob = gh.createBlob.bind(gh);
+	let refuse = true;
+	gh.createBlob = async (data) => {
+		if (refuse && data.length === 6) throw new Error("GitHub 401 Unauthorized on POST /git/blobs: Bad credentials");
+		return createBlob(data);
+	};
+	const r = await engine.sync("full");
+	assert.deepEqual(r.failed.map((f) => f.path), ["big.pdf"]);
+	assert.match(r.failed[0].error, /^Uploading "big\.pdf" \(6 B\) failed: GitHub 401 Unauthorized on POST \/git\/blobs: Bad credentials$/);
+	assert.deepEqual(Object.keys(gh.files()).sort(), ["README.md", "note.md", "small.png"]);
+	assert.equal(state.base["big.pdf"], undefined, "still pending");
+
+	refuse = false;
+	const r2 = await engine.sync("full");
+	assert.deepEqual(r2.failed, []);
+	assert.ok(gh.files()["big.pdf"] !== undefined);
+});
+
+test("a connection drop during file uploads still stops the sync", async () => {
+	const gh = new FakeGitHub();
+	await gh.seed({ "README.md": "hi" });
+	const { disk, engine } = device(gh, "mac");
+	disk.files.set("a.png", { data: new Uint8Array([0x89, 0x00, 0xff]), mtime: 0 });
+	gh.createBlob = async () => {
+		const e = new Error("Couldn't reach GitHub");
+		e.name = "NetworkError";
+		throw e;
+	};
+	await assert.rejects(engine.sync("full"), /Couldn't reach GitHub/);
+	assert.deepEqual(Object.keys(gh.files()), ["README.md"]);
+});

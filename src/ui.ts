@@ -235,6 +235,10 @@ export class SyncPanel extends ItemView {
 		this.render();
 	}
 
+	private report(): string {
+		return panelReport(this.plugin, this.pending);
+	}
+
 	private render() {
 		const { status, settings } = this.plugin;
 		const el = this.contentEl;
@@ -259,6 +263,10 @@ export class SyncPanel extends ItemView {
 			}, true);
 			button(buttons, "Refresh", () => this.reloadPending());
 		}
+		button(buttons, "Copy details", async () => {
+			await navigator.clipboard.writeText(this.report());
+			new Notice("Sync details copied");
+		});
 
 		if (settings.repo) {
 			const info = el.createDiv("sgs-info");
@@ -270,6 +278,11 @@ export class SyncPanel extends ItemView {
 		}
 
 		section(el, `Not yet pushed (${this.pending.length})`, this.pending.map((c) => ({ path: c.path, note: c.kind })), this.app);
+		if (status.failed.length) {
+			el.createEl("h6", { text: `Couldn't upload (${status.failed.length}, retried each sync)` });
+			const list = el.createDiv("sgs-list");
+			for (const f of status.failed) list.createDiv({ text: f.error, cls: "sgs-error" });
+		}
 		section(el, "Kept both versions (check these)", status.conflicts.map((path) => ({ path, note: "" })), this.app, () => {
 			status.conflicts = [];
 			this.render();
@@ -280,10 +293,27 @@ export class SyncPanel extends ItemView {
 		if (!status.log.length) log.createDiv({ text: "Nothing yet", cls: "sgs-muted" });
 		for (const entry of status.log) {
 			const row = log.createDiv();
-			row.createSpan({ text: entry.at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) + " ", cls: "sgs-muted" });
+			row.createSpan({ text: entry.at.toLocaleTimeString() + " ", cls: "sgs-muted" });
 			row.createSpan({ text: entry.text });
 		}
 	}
+}
+
+/** The panel as plain text, for pasting into a bug report. Contains no login tokens. */
+function panelReport(plugin: SimpleGitSync, pending: Change[]): string {
+	const { status, settings } = plugin;
+	const r = status.lastResult;
+	const lines = [
+		`Simple Git Sync ${plugin.manifest.version} on ${settings.deviceName} (${navigator.userAgent.match(/Obsidian\/[\d.]+/)?.[0] ?? "Obsidian"}, ${navigator.platform})`,
+		`Repository: ${settings.repo || "(none)"} @ ${plugin.branch()}; logged in: ${plugin.loggedIn() ? `yes${settings.username ? ` as ${settings.username}` : ""}` : "no"}`,
+		`Status: ${statusLine(plugin)}${status.message ? ` | ${status.message}` : ""}`,
+		`Last sync: ${status.lastSync?.toLocaleString() ?? "never"}${r ? `; GitHub at ${(r.commit ?? r.head).slice(0, 7)}; pulled ${r.pulled.length}, pushed ${r.pushed.length}, merged ${r.merged.length}, skipped ${r.skipped.length}` : ""}`,
+		`Not yet pushed: ${pending.length}`,
+	];
+	if (status.failed.length) lines.push("", "Couldn't upload:", ...status.failed.map((f) => `  ${f.error}`));
+	if (status.conflicts.length) lines.push("", "Kept both versions:", ...status.conflicts.map((c) => `  ${c}`));
+	lines.push("", "Activity (newest first):", ...status.log.map((e) => `  ${e.at.toLocaleString()}  ${e.text}`));
+	return lines.join("\n");
 }
 
 function button(parent: HTMLElement, text: string, onClick: () => unknown, cta = false) {
