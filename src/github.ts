@@ -78,6 +78,7 @@ export class GitHub implements RemoteStore {
 	}
 
 	private send(token: string, method: string, path: string, body: unknown, accept: string): Promise<RequestUrlResponse> {
+		const json = body === undefined ? undefined : JSON.stringify(body);
 		const request = requestUrl({
 			url: `${API}${path}`,
 			method,
@@ -88,13 +89,15 @@ export class GitHub implements RemoteStore {
 				"Cache-Control": "no-cache",
 			},
 			contentType: body === undefined ? undefined : "application/json",
-			body: body === undefined ? undefined : JSON.stringify(body),
+			body: json,
 			throw: false,
 		});
 		// requestUrl has no timeout of its own; a stuck request would hang the sync forever.
+		// Allow extra time for big uploads, assuming a slow (400 kbit/s) upload link.
+		const limit = Math.round(REQUEST_TIMEOUT_S + (json?.length ?? 0) / 50_000);
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		const timeout = new Promise<never>((_, reject) => {
-			timer = setTimeout(() => reject(new Error(`no answer within ${REQUEST_TIMEOUT_S} s`)), REQUEST_TIMEOUT_S * 1000);
+			timer = setTimeout(() => reject(new Error(`no answer within ${limit} s`)), limit * 1000);
 		});
 		return Promise.race([request, timeout]).finally(() => clearTimeout(timer));
 	}
