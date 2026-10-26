@@ -135,6 +135,28 @@ function newAppUrl(name: string): string {
 	return `https://github.com/settings/apps/new?${params}`;
 }
 
+export class InstallModal extends Modal {
+	constructor(
+		app: App,
+		private openInstall: () => void,
+	) {
+		super(app);
+	}
+
+	onOpen() {
+		this.setTitle("Give your sync app access to your vault");
+		const el = this.contentEl;
+		el.createEl("p", { text: "Your sync app can't see any repositories yet. On the GitHub page that opens, choose “Only select repositories”, pick your vault repository, and click Install." });
+		el.createEl("p", { text: "Then come back to Obsidian and the repository list will open.", cls: "sgs-muted" });
+		new Setting(el).addButton((b) =>
+			b.setButtonText("Open GitHub").setCta().onClick(() => {
+				this.openInstall();
+				this.close();
+			}),
+		);
+	}
+}
+
 type RepoChoice = RepoInfo | "install";
 
 export class RepoPicker extends SuggestModal<RepoChoice> {

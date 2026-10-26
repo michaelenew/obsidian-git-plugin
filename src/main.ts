@@ -2,7 +2,7 @@ import { Notice, Platform, Plugin, TAbstractFile, TFile } from "obsidian";
 import { Change, emptyState, Mode, SyncEngine, SyncResult, SyncState } from "./engine";
 import { Auth, AuthError, Credentials } from "./auth";
 import { GitHub } from "./github";
-import { LoginModal, PANEL_VIEW, RepoPicker, SettingsTab, SyncPanel } from "./ui";
+import { InstallModal, LoginModal, PANEL_VIEW, RepoPicker, SettingsTab, SyncPanel } from "./ui";
 import { VaultStore } from "./vaultStore";
 
 const TOKEN_ID = "simple-git-sync-github-token";
@@ -375,11 +375,14 @@ export default class SimpleGitSync extends Plugin {
 			const installUrl = this.settings.appSlug
 				? `https://github.com/apps/${this.settings.appSlug}/installations/new`
 				: "https://github.com/settings/apps";
-			new RepoPicker(this.app, repos, (repo) => this.setRepo(repo.fullName, repo.defaultBranch), () => {
+			const openInstall = () => {
 				// Pick up where we left off once the user comes back from GitHub.
 				this.repoPickAfterInstall = true;
 				window.open(installUrl);
-			}).open();
+			};
+			// A brand-new app can't see any repositories: go straight to granting access.
+			if (repos.length === 0) new InstallModal(this.app, openInstall).open();
+			else new RepoPicker(this.app, repos, (repo) => this.setRepo(repo.fullName, repo.defaultBranch), openInstall).open();
 		} catch (e) {
 			if (e instanceof AuthError) return this.loginExpired(e.message);
 			new Notice(`Could not list repositories: ${e instanceof Error ? e.message : e}`);
