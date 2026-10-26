@@ -1,0 +1,18 @@
+.sgs-code {
+	font-family: var(--font-monospace);
+	font-size: 2em;
+	letter-spacing: 0.15em;
+	text-align: center;
+	padding: 0.5em;
+	user-select: all;
+}
+.sgs-muted { color: var(--text-muted); }
+.sgs-panel { font-size: var(--font-ui-small); }
+.sgs-status { font-weight: 600; margin-bottom: 0.5em; }
+.sgs-error { color: var(--text-error); margin-bottom: 0.5em; word-break: break-word; }
+.sgs-buttons { display: flex; gap: 0.5em; flex-wrap: wrap; margin-bottom: 0.75em; }
+.sgs-info { margin-bottom: 0.75em; line-height: 1.6; }
+.sgs-section-head { display: flex; align-items: center; justify-content: space-between; }
+.sgs-section-head button { font-size: var(--font-ui-smaller); }
+.sgs-list, .sgs-log { line-height: 1.6; word-break: break-word; }
+.sgs-row a { cursor: pointer; }

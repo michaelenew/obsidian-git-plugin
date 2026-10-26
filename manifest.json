@@ -1,0 +1,9 @@
+{
+  "id": "simple-git-sync",
+  "name": "Simple Git Sync",
+  "version": "0.1.0",
+  "minAppVersion": "1.8.7",
+  "description": "Keeps a vault in sync with a GitHub repository. No git install, no tokens to paste: log in with GitHub and it syncs in the background.",
+  "author": "michaelenew",
+  "isDesktopOnly": false
+}

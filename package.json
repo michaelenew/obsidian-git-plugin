@@ -1,0 +1,30 @@
+{
+  "name": "simple-git-sync",
+  "version": "0.1.0",
+  "description": "Obsidian plugin: keep a vault in sync with a GitHub repository, on desktop and mobile",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc --noEmit -p . && node esbuild.config.mjs production",
+    "test": "esbuild test/*.test.ts --bundle --platform=node --format=esm --outdir=test-dist --out-extension:.js=.mjs --alias:obsidian=./test/obsidian-stub.ts --log-level=warning && node --test test-dist/*.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/michaelenew/obsidian-git-plugin.git"
+  },
+  "author": "michaelenew",
+  "license": "Apache-2.0",
+  "bugs": {
+    "url": "https://github.com/michaelenew/obsidian-git-plugin/issues"
+  },
+  "homepage": "https://github.com/michaelenew/obsidian-git-plugin#readme",
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "esbuild": "^0.28.2",
+    "obsidian": "^1.14.4",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "ignore": "^7.0.14",
+    "node-diff3": "^3.2.1"
+  }
+}
