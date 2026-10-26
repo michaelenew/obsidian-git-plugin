@@ -25,14 +25,21 @@ export class GitHub implements RemoteStore {
 		const token = await this.auth.accessToken();
 		const res = await this.sendWithRetries(token, method, path, body, accept);
 		if (res.status !== 401) return res;
-		this.onNotice(`${describe(res, method, path)}; refreshing the login and retrying`);
+		// GitHub sometimes answers one request with 401 while the login is fine. Renewing then
+		// would only churn the single-use renewal token, so first check the login itself.
+		const check = await this.sendWithRetries(token, "GET", "/user", undefined, "application/vnd.github+json");
+		if (check.status !== 401) {
+			// Seen on uploads of a few MB: the same request with the same login works the second time.
+			this.onNotice(`${describe(res, method, path)}, but the login itself works; retrying once`);
+			const again = await this.sendWithRetries(token, method, path, body, accept);
+			if (again.status !== 401) return again;
+			throw new Error(`${describe(again, method, path)} (twice, though the login itself works)`);
+		}
+		this.onNotice(`${describe(check, "GET", "/user")}; renewing the login`);
 		const fresh = await this.auth.renew(token);
 		const retry = await this.sendWithRetries(fresh, method, path, body, accept);
 		if (retry.status !== 401) return retry;
-		// Only call the login dead if GitHub rejects it for the simplest request too.
-		const check = await this.send(fresh, "GET", "/user", undefined, "application/vnd.github+json");
-		if (check.status === 401) throw new AuthError(`GitHub no longer accepts this device's login (${describe(check, "GET", "/user")})`);
-		throw new Error(describe(retry, method, path));
+		throw new AuthError(`GitHub rejected the login even after renewing it (${describe(retry, method, path)})`);
 	}
 
 	/**

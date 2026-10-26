@@ -88,10 +88,11 @@ test("being offline during a refresh is not a logout", async () => {
 });
 
 test("a 401 on one request while the login still works is an error, not a logout", async () => {
-	fakeGitHub({ api: (req) => (req.url.endsWith("/git/blobs") ? { status: 401, json: { message: "odd" }, headers: {} } : null) });
 	const { auth, get } = makeAuth({ access: "access-0", refresh: "refresh-0", expiresAt: Date.now() + 8 * HOUR });
-	await assert.rejects(new GitHub(auth, "o/r").createBlob(new Uint8Array([1])), (e) => !(e instanceof AuthError) && /401/.test(String(e)));
-	assert.ok(get());
+	const { calls } = fakeGitHub({ api: (req) => (req.url.endsWith("/git/blobs") ? { status: 401, json: { message: "odd" }, headers: {} } : null) });
+	await assert.rejects(new GitHub(auth, "o/r").createBlob(new Uint8Array([1])), (e) => !(e instanceof AuthError) && /401.*twice, though the login itself works/.test(String(e)));
+	assert.equal(get()!.refresh, "refresh-0");
+	assert.equal(calls.refresh, 0, "a working login is not renewed");
 });
 
 test("when GitHub says slow down, it waits and retries", async () => {
@@ -145,4 +146,37 @@ test("a dropped connection is retried, then reported as a NetworkError", async (
 	const { auth } = makeAuth({ access: "access-0" });
 	assert.equal(await new GitHub(auth, "o/r", (m) => notes.push(m)).user(), "me");
 	assert.match(notes[0], /Couldn't reach GitHub for GET \/user: net::ERR_CONNECTION_RESET; retrying in 2 s/);
+});
+
+test("if another copy of the plugin renewed first, its new login is used instead of logging out", async () => {
+	fakeGitHub({ refreshResponse: () => ({ error: "bad_refresh_token", error_description: "The refresh token passed is incorrect or expired." }) });
+	let stored: Credentials | null = { access: "access-0", refresh: "refresh-0", expiresAt: Date.now() - 1 };
+	const auth = new Auth(
+		() => stored,
+		(c) => (stored = c),
+		() => "Iv1.test",
+	);
+	// Simulate the other copy winning the race: storage changes while our refresh is in flight.
+	const realLoad = (auth as any).load;
+	let n = 0;
+	(auth as any).load = () => (n++ === 0 ? realLoad() : { access: "access-other", refresh: "refresh-other" });
+	assert.equal(await auth.accessToken(), "access-other");
+});
+
+test("a refused renewal says why", async () => {
+	fakeGitHub({ refreshResponse: () => ({ error: "bad_refresh_token", error_description: "The refresh token passed is incorrect or expired." }) });
+	const { auth } = makeAuth({ access: "access-0", refresh: "refresh-0", expiresAt: Date.now() - 1 });
+	await assert.rejects(auth.accessToken(), /GitHub refused to renew the login: The refresh token passed is incorrect or expired\. \(bad_refresh_token\)/);
+});
+
+test("a 401 on an upload while the login works is retried once with the same login", async () => {
+	let blobs = 0;
+	const { calls } = fakeGitHub({
+		api: (req) => (req.url.endsWith("/git/blobs") && blobs++ === 0 ? { status: 401, json: { message: "Bad credentials" }, headers: {} } : req.url.endsWith("/git/blobs") ? { status: 201, json: { sha: "abc" }, headers: {} } : null),
+	});
+	const notes: string[] = [];
+	const { auth } = makeAuth({ access: "access-0", refresh: "refresh-0", expiresAt: Date.now() + 8 * HOUR });
+	assert.equal(await new GitHub(auth, "o/r", (m) => notes.push(m)).createBlob(new Uint8Array([1])), "abc");
+	assert.equal(calls.refresh, 0);
+	assert.match(notes[0], /GitHub 401 Unauthorized on POST \/git\/blobs: Bad credentials, but the login itself works; retrying once/);
 });

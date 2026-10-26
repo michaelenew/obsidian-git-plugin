@@ -5,7 +5,8 @@ import { GitHub } from "./github";
 import { InstallModal, LoginModal, PANEL_VIEW, RepoPicker, SettingsTab, SyncPanel } from "./ui";
 import { VaultStore } from "./vaultStore";
 
-const TOKEN_ID = "simple-git-sync-github-token";
+/** Used by versions up to 0.1.5, shared by every vault on the device. */
+const LEGACY_TOKEN_ID = "simple-git-sync-github-token";
 
 export interface Settings {
 	repo: string;
@@ -22,6 +23,8 @@ export interface Settings {
 	clientId: string;
 	/** That app's short name in GitHub URLs, e.g. simple-git-sync-k3x9q */
 	appSlug: string;
+	/** Moved the login from the shared pre-0.1.6 storage entry to this vault's own */
+	tokenMigrated: boolean;
 }
 
 function defaultDeviceName(): string {
@@ -42,6 +45,7 @@ const DEFAULTS: Omit<Settings, "deviceName"> = {
 	syncOnFileSwitch: true,
 	clientId: "",
 	appSlug: "",
+	tokenMigrated: false,
 };
 
 export type Phase = "logged-out" | "no-repo" | "idle" | "syncing" | "offline" | "error";
@@ -233,6 +237,7 @@ export default class SimpleGitSync extends Plugin {
 		this.running = true;
 		this.setPhase("syncing", mode === "full" ? "syncing…" : "checking GitHub…");
 		const dirtyAtStart = new Set(this.dirty);
+		const loginAtStart = this.credentials();
 		try {
 			const result = await this.getEngine().sync(mode);
 			if (mode === "full") for (const p of dirtyAtStart) this.dirty.delete(p);
@@ -240,13 +245,21 @@ export default class SimpleGitSync extends Plugin {
 			this.status.lastResult = result;
 			this.report(result, manual);
 			this.lastErrorShown = "";
+			this.retriedNewLogin = false;
 			this.setPhase("idle", "");
 		} catch (e) {
 			const msg = e instanceof Error ? e.message : String(e);
 			this.addLog(`error: ${msg}`);
 			// Whatever was pulled before the error is on disk; remember that.
 			await this.save().catch(() => {});
-			if (e instanceof AuthError) {
+			const loginNow = this.credentials();
+			if (e instanceof AuthError && loginNow && loginNow.refresh !== loginAtStart?.refresh && !this.retriedNewLogin) {
+				this.retriedNewLogin = true;
+				// Another copy of the plugin renewed the login during this sync; the new one is fine.
+				this.addLog("the login was renewed during this sync; retrying with the new one");
+				this.setPhase("idle", "");
+				this.schedule("full", 5000);
+			} else if (e instanceof AuthError) {
 				this.loginExpired(msg);
 			} else if (e instanceof NetworkError) {
 				// Offline or no signal: not an error. The next trigger or the "online" event retries.
@@ -361,7 +374,14 @@ export default class SimpleGitSync extends Plugin {
 	/** The login lives in Obsidian's secret storage (or app storage on older versions), never in the vault folder. */
 	credentials(): Credentials | null {
 		const secrets = (this.app as any).secretStorage;
-		const raw: string | null = secrets ? secrets.getSecret(TOKEN_ID) : this.app.loadLocalStorage(TOKEN_ID);
+		let raw: string | null = secrets ? secrets.getSecret(this.tokenId()) : this.app.loadLocalStorage(this.tokenId());
+		if (!raw && !this.settings.tokenMigrated) {
+			// One-time move from the shared entry. It's left in place in case another vault still uses it.
+			raw = secrets ? secrets.getSecret(LEGACY_TOKEN_ID) : this.app.loadLocalStorage(LEGACY_TOKEN_ID);
+			this.settings.tokenMigrated = true;
+			void this.save();
+			if (raw) this.writeSecret(raw);
+		}
 		if (!raw) return null;
 		try {
 			const c = JSON.parse(raw);
@@ -373,10 +393,22 @@ export default class SimpleGitSync extends Plugin {
 	}
 
 	private setCredentials(c: Credentials | null) {
-		const raw = c ? JSON.stringify(c) : null;
+		this.writeSecret(c ? JSON.stringify(c) : null);
+	}
+
+	private writeSecret(raw: string | null) {
 		const secrets = (this.app as any).secretStorage;
-		if (secrets) secrets.setSecret(TOKEN_ID, raw ?? "");
-		this.app.saveLocalStorage(TOKEN_ID, secrets ? null : raw);
+		if (secrets) secrets.setSecret(this.tokenId(), raw ?? "");
+		this.app.saveLocalStorage(this.tokenId(), secrets ? null : raw);
+	}
+
+	/**
+	 * Obsidian's secret storage is shared by all vaults on the device, so each vault
+	 * keeps its login under its own name; another vault can't overwrite or clear it.
+	 */
+	private tokenId(): string {
+		const vault = String((this.app as any).appId ?? this.app.vault.getName());
+		return `simple-git-sync-${vault.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 40)}`;
 	}
 
 	loggedIn(): boolean {
@@ -387,7 +419,8 @@ export default class SimpleGitSync extends Plugin {
 	private loginExpired(reason: string) {
 		this.setCredentials(null);
 		this.setPhase("logged-out", reason);
-		new Notice("Git sync: your GitHub login expired. Please log in again.", 10000);
+		// Stays until dismissed, with GitHub's reason, so the cause can be reported.
+		new Notice(`Git sync: please log in to GitHub again.\n\nReason: ${reason}`, 0);
 		this.login();
 	}
 
@@ -461,6 +494,8 @@ export default class SimpleGitSync extends Plugin {
 
 	private lastProgress = 0;
 	private lastErrorShown = "";
+	/** Retried once after the login changed mid-sync; a second refusal is a real logout. */
+	private retriedNewLogin = false;
 	private lastFailedShown = "";
 
 	/** Show what a long sync is doing, without redrawing the panel on every file. */
