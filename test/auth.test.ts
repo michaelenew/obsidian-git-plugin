@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { Auth, AuthError, Credentials, NetworkError } from "../src/auth";
+import { Auth, AuthError, Credentials, NetworkError, StoppedError } from "../src/auth";
 import { GitHub } from "../src/github";
 
 const HOUR = 3600_000;
@@ -179,4 +179,13 @@ test("a 401 on an upload while the login works is retried once with the same log
 	assert.equal(await new GitHub(auth, "o/r", (m) => notes.push(m)).createBlob(new Uint8Array([1])), "abc");
 	assert.equal(calls.refresh, 0);
 	assert.match(notes[0], /GitHub 401 Unauthorized on POST \/git\/blobs: Bad credentials, but the login itself works; retrying once/);
+});
+
+test("after the plugin unloads, leftover work gets no token and never renews or changes the login", async () => {
+	const { calls } = fakeGitHub();
+	const { auth, get } = makeAuth({ access: "access-0", refresh: "refresh-0", expiresAt: Date.now() - 1 });
+	auth.stop();
+	await assert.rejects(new GitHub(auth, "o/r").user(), StoppedError);
+	assert.equal(calls.refresh + calls.api, 0);
+	assert.equal(get()!.refresh, "refresh-0");
 });

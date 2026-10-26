@@ -124,6 +124,9 @@ export default class SimpleGitSync extends Plugin {
 	}
 
 	onunload() {
+		// A sync in flight can't be cancelled, so make sure it can't do anything more.
+		this.active = false;
+		this.auth.stop();
 		if (this.timer !== null) window.clearTimeout(this.timer);
 	}
 
@@ -223,7 +226,7 @@ export default class SimpleGitSync extends Plugin {
 	}
 
 	private async run(mode: Mode, manual = false): Promise<void> {
-		if (!this.loggedIn() || !this.settings.repo) return;
+		if (!this.active || !this.loggedIn() || !this.settings.repo) return;
 		if (isOffline()) {
 			// Nothing to try; the "online" event starts a sync when the connection returns.
 			this.setPhase("offline", "");
@@ -248,6 +251,7 @@ export default class SimpleGitSync extends Plugin {
 			this.retriedNewLogin = false;
 			this.setPhase("idle", "");
 		} catch (e) {
+			if (!this.active) return;
 			const msg = e instanceof Error ? e.message : String(e);
 			this.addLog(`error: ${msg}`);
 			// Whatever was pulled before the error is on disk; remember that.
@@ -382,7 +386,14 @@ export default class SimpleGitSync extends Plugin {
 			void this.save();
 			if (raw) this.writeSecret(raw);
 		}
-		if (!raw) return null;
+		if (!raw) {
+			if (this.expectLogin) {
+				this.expectLogin = false;
+				this.addLog("the saved GitHub login disappeared from Obsidian's secret storage, without this copy of the plugin removing it");
+			}
+			return null;
+		}
+		this.expectLogin = true;
 		try {
 			const c = JSON.parse(raw);
 			if (c && typeof c.access === "string") return c;
@@ -397,6 +408,8 @@ export default class SimpleGitSync extends Plugin {
 	}
 
 	private writeSecret(raw: string | null) {
+		if (!this.active) return;
+		this.expectLogin = raw !== null;
 		const secrets = (this.app as any).secretStorage;
 		if (secrets) secrets.setSecret(this.tokenId(), raw ?? "");
 		this.app.saveLocalStorage(this.tokenId(), secrets ? null : raw);
@@ -417,6 +430,7 @@ export default class SimpleGitSync extends Plugin {
 
 	/** The login can't be refreshed (unused for 6 months, or revoked): ask again. */
 	private loginExpired(reason: string) {
+		if (!this.active) return;
 		this.setCredentials(null);
 		this.setPhase("logged-out", reason);
 		// Stays until dismissed, with GitHub's reason, so the cause can be reported.
@@ -496,6 +510,10 @@ export default class SimpleGitSync extends Plugin {
 	private lastErrorShown = "";
 	/** Retried once after the login changed mid-sync; a second refusal is a real logout. */
 	private retriedNewLogin = false;
+	/** False once unloaded; an old copy's leftover work must not touch the login or saved state. */
+	private active = true;
+	/** Whether the login should be in storage, to notice if it vanishes without us removing it. */
+	private expectLogin = false;
 	private lastFailedShown = "";
 
 	/** Show what a long sync is doing, without redrawing the panel on every file. */
@@ -543,6 +561,8 @@ export default class SimpleGitSync extends Plugin {
 	}
 
 	async save() {
+		// An unloaded copy's state is out of date; the new copy owns data.json now.
+		if (!this.active) return;
 		await this.saveData({ settings: this.settings, state: this.state });
 	}
 }
