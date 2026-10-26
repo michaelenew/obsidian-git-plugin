@@ -418,11 +418,53 @@ test("a connection drop during file uploads still stops the sync", async () => {
 	await gh.seed({ "README.md": "hi" });
 	const { disk, engine } = device(gh, "mac");
 	disk.files.set("a.png", { data: new Uint8Array([0x89, 0x00, 0xff]), mtime: 0 });
-	gh.createBlob = async () => {
+	const down = () => {
 		const e = new Error("Couldn't reach GitHub");
 		e.name = "NetworkError";
 		throw e;
 	};
+	gh.createBlob = async () => {
+		gh.getHead = async () => down();
+		return down();
+	};
 	await assert.rejects(engine.sync("full"), /Couldn't reach GitHub/);
 	assert.deepEqual(Object.keys(gh.files()), ["README.md"]);
+});
+
+test("large attachments go in a second commit after everything else", async () => {
+	const gh = new FakeGitHub();
+	await gh.seed({ "README.md": "hi" });
+	const { disk, engine } = device(gh, "mac");
+	disk.put("note.md", "text");
+	disk.files.set("small.png", { data: new Uint8Array([0x89, 0x00, 0xff]), mtime: 0 });
+	const big = new Uint8Array(6 * 1024 * 1024).fill(0xff);
+	disk.files.set("Recording.webm", { data: big, mtime: 0 });
+	const commits: string[][] = [];
+	const createCommit = gh.createCommit.bind(gh);
+	gh.createCommit = async (message, tree, parents) => {
+		commits.push(Object.keys(Object.fromEntries(gh.trees.get(tree)!)).sort());
+		return createCommit(message, tree, parents);
+	};
+	const r = await engine.sync("full");
+	assert.equal(commits.length, 2);
+	assert.deepEqual(commits[0], ["README.md", "note.md", "small.png"]);
+	assert.ok(commits[1].includes("Recording.webm"));
+	assert.equal(r.pushed.length, 3);
+	assert.equal(r.commit, gh.refs.get("main"));
+});
+
+test("an upload that times out while GitHub is still reachable fails only that file", async () => {
+	const gh = new FakeGitHub();
+	await gh.seed({ "README.md": "hi" });
+	const { disk, engine } = device(gh, "mac");
+	disk.put("note.md", "text");
+	disk.files.set("slow.m4a", { data: new Uint8Array([0xff, 0xfb, 0x00]), mtime: 0 });
+	gh.createBlob = async () => {
+		const e = new Error("Couldn't reach GitHub for POST /git/blobs: no answer within 121 s");
+		e.name = "NetworkError";
+		throw e;
+	};
+	const r = await engine.sync("full");
+	assert.deepEqual(r.failed.map((f) => f.path), ["slow.m4a"]);
+	assert.equal(gh.files()["note.md"], "text");
 });

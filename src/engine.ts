@@ -99,6 +99,8 @@ export interface SyncResult {
 	skipped: string[];
 	/** Files GitHub wouldn't take this time; everything else was synced. Retried next sync. */
 	failed: Array<{ path: string; error: string }>;
+	/** Large files held back so the rest could be pushed first */
+	deferred: number;
 }
 
 export interface EngineOptions {
@@ -125,6 +127,10 @@ const INLINE_MAX_FILE = 1024 * 1024;
 const TREE_BATCH_BYTES = 4 * 1024 * 1024;
 const TREE_BATCH_FILES = 500;
 const BLOB_CONCURRENCY = 2;
+// Big attachments go in a second commit, after everything else is safely pushed.
+const LARGE_FILE = 5 * 1024 * 1024;
+// GitHub refuses files over 100 MB.
+const MAX_FILE = 100 * 1024 * 1024;
 
 export class SyncEngine {
 	private treeCache: { commit: string; tree: RemoteTree } | null = null;
@@ -146,8 +152,23 @@ export class SyncEngine {
 	}
 
 	async sync(mode: Mode): Promise<SyncResult> {
+		const first = await this.attempts(mode, false);
+		if (!first.deferred) return first;
+		this.log(`pushed everything else; now uploading ${first.deferred} large file${first.deferred > 1 ? "s" : ""}`);
+		const second = await this.attempts(mode, true);
+		return {
+			...second,
+			commit: second.commit ?? first.commit,
+			pulled: [...first.pulled, ...second.pulled],
+			pushed: [...first.pushed, ...second.pushed],
+			merged: [...first.merged, ...second.merged],
+			conflicts: [...first.conflicts, ...second.conflicts],
+		};
+	}
+
+	private async attempts(mode: Mode, allowLarge: boolean): Promise<SyncResult> {
 		for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-			const result = await this.attempt(mode);
+			const result = await this.attempt(mode, allowLarge);
 			if (result) return result;
 			this.log(`${this.opts.branch} moved while pushing; retrying (${attempt}/${MAX_ATTEMPTS})`);
 		}
@@ -170,10 +191,10 @@ export class SyncEngine {
 	}
 
 	/** One pass. Returns null when main moved under us and the pass must be redone. */
-	private async attempt(mode: Mode): Promise<SyncResult | null> {
+	private async attempt(mode: Mode, allowLarge: boolean): Promise<SyncResult | null> {
 		const head = await this.remote.getHead(this.opts.branch);
 		const result: SyncResult = {
-			mode, head, commit: null, pulled: [], pushed: [], merged: [], conflicts: [], skipped: [], failed: [],
+			mode, head, commit: null, pulled: [], pushed: [], merged: [], conflicts: [], skipped: [], failed: [], deferred: 0,
 		};
 		if (mode === "pull" && head === this.settledHead) return result;
 
@@ -265,7 +286,7 @@ export class SyncEngine {
 			CONCURRENCY,
 		);
 
-		const changes = mode === "full" && toPush.size > 0 ? await this.prepareUpload(toPush, remote, result) : [];
+		const changes = mode === "full" && toPush.size > 0 ? await this.prepareUpload(toPush, remote, result, allowLarge) : [];
 		if (changes.length === 0) {
 			this.state.lastCommit = head;
 			this.settledHead = settled ? head : null;
@@ -299,6 +320,7 @@ export class SyncEngine {
 		paths: Set<string>,
 		remote: Map<string, RemoteEntry>,
 		result: SyncResult,
+		allowLarge: boolean,
 	): Promise<Array<{ change: TreeChange; kind: ChangeKind }>> {
 		const out: Array<{ change: TreeChange; kind: ChangeKind }> = [];
 		const blobs: Array<{ change: TreeChange; data: Uint8Array }> = [];
@@ -329,20 +351,43 @@ export class SyncEngine {
 			CONCURRENCY * 4,
 		);
 
-		let uploaded = 0;
 		const failed = new Set<string>();
+		const fail = (path: string, error: string) => {
+			this.log(error);
+			result.failed.push({ path, error });
+			failed.add(path);
+		};
+		for (const b of blobs.filter((b) => b.data.length > MAX_FILE)) {
+			fail(b.change.path, `"${b.change.path}" (${formatSize(b.data.length)}) is over GitHub's 100 MB limit per file; not synced`);
+		}
+		let toUpload = blobs.filter((b) => b.data.length <= MAX_FILE);
+		// Hold big files back if anything else is waiting, so they can't delay it.
+		const big = toUpload.filter((b) => b.data.length > LARGE_FILE);
+		if (!allowLarge && big.length && out.length > big.length + failed.size) {
+			for (const b of big) failed.add(b.change.path);
+			result.deferred = big.length;
+			toUpload = toUpload.filter((b) => b.data.length <= LARGE_FILE);
+		}
+		// Smallest first: one slow file then holds up as little as possible.
+		toUpload.sort((a, b) => a.data.length - b.data.length);
+
+		let uploaded = 0;
 		await runLimited(
-			blobs.map(({ change, data }) => async () => {
-				this.opts.progress?.(`uploading file ${++uploaded} of ${blobs.length}`);
+			toUpload.map(({ change, data }) => async () => {
+				const name = change.path.split("/").pop();
+				this.opts.progress?.(`uploading attachment ${++uploaded} of ${toUpload.length} (${name}, ${formatSize(data.length)})`);
+				if (data.length > LARGE_FILE) this.log(`uploading ${change.path} (${formatSize(data.length)})…`);
 				try {
 					await this.uploadBlob(change.path, data, change.sha!);
 				} catch (e) {
-					// Offline or logged out: stop. Anything else is about this one file: sync the rest.
-					if (e instanceof Error && (e.name === "NetworkError" || e.name === "AuthError")) throw e;
-					const error = `Uploading "${change.path}" (${formatSize(data.length)}) failed: ${e instanceof Error ? e.message : e}`;
-					this.log(error);
-					result.failed.push({ path: change.path, error });
-					failed.add(change.path);
+					if (e instanceof Error && e.name === "AuthError") throw e;
+					// A dropped connection or timeout: if GitHub still answers, it was this file, not the connection.
+					if (e instanceof Error && e.name === "NetworkError") {
+						await this.remote.getHead(this.opts.branch).catch(() => {
+							throw e;
+						});
+					}
+					fail(change.path, `Uploading "${change.path}" (${formatSize(data.length)}) failed: ${e instanceof Error ? e.message : e}`);
 				}
 			}),
 			BLOB_CONCURRENCY,
