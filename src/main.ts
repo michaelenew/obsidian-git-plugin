@@ -52,13 +52,15 @@ export interface Status {
 	lastSync: Date | null;
 	lastResult: SyncResult | null;
 	conflicts: string[];
+	/** Files the last full sync couldn't upload, with GitHub's answer */
+	failed: Array<{ path: string; error: string }>;
 	log: Array<{ at: Date; text: string }>;
 }
 
 export default class SimpleGitSync extends Plugin {
 	settings!: Settings;
 	private state!: SyncState;
-	status: Status = { phase: "logged-out", message: "", lastSync: null, lastResult: null, conflicts: [], log: [] };
+	status: Status = { phase: "logged-out", message: "", lastSync: null, lastResult: null, conflicts: [], failed: [], log: [] };
 
 	private engine: SyncEngine | null = null;
 	private running = false;
@@ -76,7 +78,12 @@ export default class SimpleGitSync extends Plugin {
 	private loginOpen = false;
 	private lastLoginPrompt = 0;
 	private repoPickAfterInstall = false;
-	readonly auth = new Auth(() => this.credentials(), (c) => this.setCredentials(c), () => this.clientId());
+	readonly auth = new Auth(
+		() => this.credentials(),
+		(c) => this.setCredentials(c),
+		() => this.clientId(),
+		(c) => this.addLog(`GitHub login renewed${c.expiresAt ? `; valid until ${new Date(c.expiresAt).toLocaleString()}` : ""}`),
+	);
 	statusBar: HTMLElement | null = null;
 
 	async onload() {
@@ -265,6 +272,16 @@ export default class SimpleGitSync extends Plugin {
 		if (r.merged.length) parts.push(`merged ${r.merged.length}`);
 		if (r.pushed.length) parts.push(`pushed ${r.pushed.length}`);
 		if (parts.length) this.addLog(`${parts.join(", ")}${r.commit ? ` (${r.commit.slice(0, 7)})` : ""}`);
+		this.status.failed = r.mode === "full" ? r.failed : this.status.failed;
+		if (r.failed.length) {
+			const names = r.failed.map((f) => f.path).join("\n");
+			if (names !== this.lastFailedShown) {
+				new Notice(`Git sync couldn't upload:\n${names}\nEverything else synced. It will retry; details in the sync panel.`, 15000);
+				this.lastFailedShown = names;
+			}
+		} else if (r.mode === "full") {
+			this.lastFailedShown = "";
+		}
 		if (r.conflicts.length) {
 			this.status.conflicts = [...new Set([...r.conflicts, ...this.status.conflicts])].slice(0, 50);
 			this.addLog(`kept both versions: ${r.conflicts.join(", ")}`);
@@ -437,6 +454,7 @@ export default class SimpleGitSync extends Plugin {
 
 	private lastProgress = 0;
 	private lastErrorShown = "";
+	private lastFailedShown = "";
 
 	/** Show what a long sync is doing, without redrawing the panel on every file. */
 	private progress(message: string) {
@@ -454,7 +472,7 @@ export default class SimpleGitSync extends Plugin {
 			return;
 		}
 		this.status.log.unshift({ at: new Date(), text });
-		this.status.log.length = Math.min(this.status.log.length, 40);
+		this.status.log.length = Math.min(this.status.log.length, 200);
 	}
 
 	onChange(cb: () => void): () => void {

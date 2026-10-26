@@ -1,9 +1,13 @@
 import { requestUrl } from "obsidian";
 
-export class AuthError extends Error {}
+export class AuthError extends Error {
+	name = "AuthError";
+}
 
 /** GitHub couldn't be reached at all (offline, no signal, DNS, timeout). Sync resumes when back online. */
-export class NetworkError extends Error {}
+export class NetworkError extends Error {
+	name = "NetworkError";
+}
 
 export function isOffline(): boolean {
 	return typeof navigator !== "undefined" && navigator.onLine === false;
@@ -71,6 +75,7 @@ export class Auth {
 		private load: () => Credentials | null,
 		private store: (c: Credentials | null) => void,
 		private clientId: () => string,
+		private onRenew: (c: Credentials) => void = () => {},
 	) {}
 
 	async accessToken(): Promise<string> {
@@ -111,6 +116,7 @@ export class Auth {
 		}
 		const next = credentialsFrom(j);
 		this.store(next);
+		this.onRenew(next);
 		return next.access;
 	}
 }
