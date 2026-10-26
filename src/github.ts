@@ -64,14 +64,29 @@ export class GitHub implements RemoteStore {
 		return { fullName: j.full_name, defaultBranch: j.default_branch, private: j.private };
 	}
 
-	async listRepos(): Promise<RepoInfo[]> {
-		const out: RepoInfo[] = [];
-		for (let page = 1; page <= 5; page++) {
-			const j = await this.json("GET", `/user/repos?per_page=100&sort=updated&page=${page}`);
-			out.push(...j.map((x: any) => ({ fullName: x.full_name, defaultBranch: x.default_branch, private: x.private })));
-			if (j.length < 100) break;
+	/**
+	 * Repositories this login can sync, plus the GitHub App's short name
+	 * (for linking to its install page). GitHub App logins only reach the
+	 * repositories the app is installed on.
+	 */
+	async listRepos(): Promise<{ repos: RepoInfo[]; appSlug: string | null }> {
+		const toInfo = (x: any): RepoInfo => ({ fullName: x.full_name, defaultBranch: x.default_branch, private: x.private });
+		const res = await this.call("GET", "/user/installations?per_page=100");
+		if (res.status >= 400) {
+			// Not a GitHub App login (e.g. an OAuth App): list everything the user can see.
+			const j = await this.json("GET", "/user/repos?per_page=100&sort=updated");
+			return { repos: j.map(toInfo), appSlug: null };
 		}
-		return out;
+		const installations: any[] = res.json.installations ?? [];
+		const repos: RepoInfo[] = [];
+		for (const inst of installations) {
+			for (let page = 1; page <= 5; page++) {
+				const j = await this.json("GET", `/user/installations/${inst.id}/repositories?per_page=100&page=${page}`);
+				repos.push(...j.repositories.map(toInfo));
+				if (j.repositories.length < 100) break;
+			}
+		}
+		return { repos, appSlug: installations[0]?.app_slug ?? null };
 	}
 
 	async getHead(branch: string): Promise<string> {

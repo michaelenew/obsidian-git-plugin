@@ -68,23 +68,14 @@ On desktop the status bar also shows `Git: synced 2 min ago`.
 
 ## Setup
 
-### Once: create the GitHub App (plugin owner only)
-
-GitHub's "log in with a code" flow needs an app registered on GitHub to identify the plugin. It takes two minutes and is done once, by whoever publishes the plugin, not on each device. Using a GitHub App (rather than the older "OAuth App") means the login can only ever touch the repositories you install it on.
-
-1. GitHub → **Settings → Developer settings → GitHub Apps → New GitHub App**.
-2. Name: anything (e.g. `Simple Git Sync (yourname)`). Homepage URL: this repository's URL.
-3. Tick **Enable Device Flow**. Untick **Webhook → Active**.
-4. **Repository permissions → Contents: Read and write.** Nothing else.
-5. **Where can this GitHub App be installed?** Only on this account. Create it.
-6. **Install App** → your account → **Only select repositories** → pick your vault repository.
-7. Copy the **Client ID** (starts with `Iv`) into `DEFAULT_CLIENT_ID` in `src/main.ts` and publish a release. (Alternatively paste it under the plugin's Advanced settings on each device.)
-
-### On each device
-
 1. Install the plugin. Until it's in Obsidian's community list, use [BRAT](https://github.com/TfTHacker/obsidian42-brat): install BRAT from Community plugins, then **BRAT → Add beta plugin →** `michaelenew/obsidian-git-plugin`.
-2. Enable **Simple Git Sync**. A login window opens: tap **Copy code and open GitHub**, paste the code, approve.
-3. Pick the vault repository from the list. The first sync downloads everything.
+2. Enable **Simple Git Sync**. The plugin walks you through the rest:
+   - **First device only: create your sync app.** Logging in goes through a small GitHub App that belongs to you, so no third party's app ever has access to your notes. The plugin opens GitHub's "new app" page with everything filled in (private, no webhook, access to file contents only). Tick **Enable Device Flow**, click **Create GitHub App**, and paste the **Client ID** from the next page back into the plugin. On later devices, the plugin links to your list of GitHub apps so you can copy the same Client ID.
+   - **Log in:** tap **Copy code and open GitHub**, paste the code, approve.
+   - **Pick the repository.** The first time, choose **Give the sync app access to a repository…**, pick *Only select repositories* and your vault repository on GitHub, then come back to Obsidian; the list reopens with it.
+3. The first sync downloads everything.
+
+The Client ID is stored in the plugin's settings on each device. It is not a secret, but it is yours: it never goes into the plugin's code or into the vault.
 
 For a new device, start from an empty vault. If the vault already has files, they're merged with GitHub's: files that exist on both sides with different contents are kept as two files.
 

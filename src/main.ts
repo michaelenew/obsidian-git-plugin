@@ -5,12 +5,6 @@ import { GitHub } from "./github";
 import { LoginModal, PANEL_VIEW, RepoPicker, SettingsTab, SyncPanel } from "./ui";
 import { VaultStore } from "./vaultStore";
 
-/**
- * Client ID of the GitHub App (or OAuth App) used for "Log in with GitHub".
- * A client ID is public, not a secret. See README for the one-time setup.
- */
-export const DEFAULT_CLIENT_ID = "";
-
 const TOKEN_ID = "simple-git-sync-github-token";
 
 export interface Settings {
@@ -24,7 +18,10 @@ export interface Settings {
 	pullIntervalSec: number;
 	idlePushSec: number;
 	syncOnFileSwitch: boolean;
+	/** The user's own GitHub App, created during setup. Kept per device, never synced or committed. */
 	clientId: string;
+	/** That app's short name in GitHub URLs, e.g. simple-git-sync-k3x9q */
+	appSlug: string;
 }
 
 function defaultDeviceName(): string {
@@ -44,6 +41,7 @@ const DEFAULTS: Omit<Settings, "deviceName"> = {
 	idlePushSec: 120,
 	syncOnFileSwitch: true,
 	clientId: "",
+	appSlug: "",
 };
 
 export type Phase = "logged-out" | "no-repo" | "idle" | "syncing" | "error";
@@ -77,6 +75,7 @@ export default class SimpleGitSync extends Plugin {
 	private listeners = new Set<() => void>();
 	private loginOpen = false;
 	private lastLoginPrompt = 0;
+	private repoPickAfterInstall = false;
 	readonly auth = new Auth(() => this.credentials(), (c) => this.setCredentials(c), () => this.clientId());
 	statusBar: HTMLElement | null = null;
 
@@ -150,6 +149,9 @@ export default class SimpleGitSync extends Plugin {
 		this.registerDomEvent(document, "visibilitychange", () => {
 			if (document.visibilityState === "hidden") {
 				if (this.dirty.size) this.schedule("full", 0);
+			} else if (this.repoPickAfterInstall && !this.settings.repo) {
+				this.repoPickAfterInstall = false;
+				void this.chooseRepo();
 			} else if (!this.loggedIn()) {
 				// Re-ask on return to the app, but not every time if the user keeps dismissing it.
 				if (Date.now() - this.lastLoginPrompt > 30 * 60 * 1000) this.login();
@@ -337,7 +339,7 @@ export default class SimpleGitSync extends Plugin {
 	}
 
 	clientId() {
-		return this.settings.clientId.trim() || DEFAULT_CLIENT_ID;
+		return this.settings.clientId.trim();
 	}
 
 	login() {
@@ -365,8 +367,19 @@ export default class SimpleGitSync extends Plugin {
 	async chooseRepo() {
 		if (!this.loggedIn()) return this.login();
 		try {
-			const repos = await new GitHub(this.auth, "").listRepos();
-			new RepoPicker(this.app, repos, (repo) => this.setRepo(repo.fullName, repo.defaultBranch)).open();
+			const { repos, appSlug } = await new GitHub(this.auth, "").listRepos();
+			if (appSlug && appSlug !== this.settings.appSlug) {
+				this.settings.appSlug = appSlug;
+				await this.save();
+			}
+			const installUrl = this.settings.appSlug
+				? `https://github.com/apps/${this.settings.appSlug}/installations/new`
+				: "https://github.com/settings/apps";
+			new RepoPicker(this.app, repos, (repo) => this.setRepo(repo.fullName, repo.defaultBranch), () => {
+				// Pick up where we left off once the user comes back from GitHub.
+				this.repoPickAfterInstall = true;
+				window.open(installUrl);
+			}).open();
 		} catch (e) {
 			if (e instanceof AuthError) return this.loginExpired(e.message);
 			new Notice(`Could not list repositories: ${e instanceof Error ? e.message : e}`);

@@ -28,10 +28,8 @@ export class LoginModal extends Modal {
 		const el = this.contentEl;
 		el.empty();
 		const clientId = this.plugin.clientId();
-		if (!clientId) {
-			el.createEl("p", { text: "This build of the plugin has no GitHub App client ID yet. Set one under Settings → Simple Git Sync → Advanced (see the plugin README)." });
-			return;
-		}
+		if (!clientId) return this.setup();
+		this.setTitle("Log in to GitHub");
 		el.createEl("p", { text: "Asking GitHub for a login code…" });
 		try {
 			const code = await startDeviceLogin(clientId);
@@ -54,8 +52,68 @@ export class LoginModal extends Modal {
 			if (this.cancelled) return;
 			el.empty();
 			el.createEl("p", { text: `Login failed: ${e instanceof Error ? e.message : e}` });
-			new Setting(el).addButton((b) => b.setButtonText("Try again").onClick(() => this.start()));
+			const slug = this.plugin.settings.appSlug;
+			const hint = el.createEl("p", { cls: "sgs-muted" });
+			hint.appendText("If you just created your sync app, check that “Enable Device Flow” is ticked in ");
+			hint.createEl("a", { text: "its settings", href: slug ? `https://github.com/settings/apps/${slug}` : "https://github.com/settings/apps" }).setAttr("target", "_blank");
+			hint.appendText(".");
+			new Setting(el)
+				.addButton((b) => b.setButtonText("Try again").setCta().onClick(() => this.start()))
+				.addButton((b) =>
+					b.setButtonText("Set up a different app").onClick(async () => {
+						this.plugin.settings.clientId = "";
+						await this.plugin.save();
+						this.setup();
+					}),
+				);
 		}
+	}
+
+	/**
+	 * First run: the login goes through a GitHub App the user owns. GitHub
+	 * lets us pre-fill the "new app" form with a link, but two things can't be
+	 * automated: ticking "Enable Device Flow", and handing the app's ID back.
+	 */
+	private setup() {
+		const el = this.contentEl;
+		el.empty();
+		this.setTitle("Set up GitHub login");
+		el.createEl("p", { text: "Sync logs in through a small GitHub app that belongs to you, so no one else's app ever gets access to your notes. This is a one-time step." });
+
+		el.createEl("p", { text: "1. Create the app. Everything is filled in; on that page just tick “Enable Device Flow”, then click “Create GitHub App” at the bottom." });
+		new Setting(el).addButton((b) =>
+			b.setButtonText("Create my sync app on GitHub").setCta().onClick(() => {
+				const name = `Simple Git Sync ${Math.random().toString(36).slice(2, 7)}`;
+				this.plugin.settings.appSlug = name.toLowerCase().replace(/ /g, "-");
+				void this.plugin.save();
+				window.open(newAppUrl(name));
+			}),
+		);
+
+		el.createEl("p", { text: "2. Copy the Client ID shown at the top of the app's page and paste it here." });
+		const error = el.createEl("p", { cls: "sgs-error" });
+		let value = "";
+		new Setting(el)
+			.addText((t) => t.setPlaceholder("Iv23li…").onChange((v) => (value = v.trim())))
+			.addButton((b) =>
+				b.setButtonText("Continue").onClick(async () => {
+					if (/^[0-9a-f]{40}$/i.test(value)) {
+						error.setText("That looks like a client secret. Sync only needs the Client ID; please don't paste secrets anywhere.");
+					} else if (!/^[A-Za-z0-9.]{16,40}$/.test(value)) {
+						error.setText("That doesn't look like a Client ID. It's near the top of the app's page, under “About”.");
+					} else {
+						this.plugin.settings.clientId = value;
+						await this.plugin.save();
+						void this.start();
+					}
+				}),
+			);
+
+		const again = el.createEl("p", { cls: "sgs-muted" });
+		again.appendText("Already did this on another device? ");
+		const link = again.createEl("a", { text: "Open your GitHub apps", href: "https://github.com/settings/apps" });
+		link.setAttr("target", "_blank");
+		again.appendText(", click your sync app and copy its Client ID.");
 	}
 
 	onClose() {
@@ -64,28 +122,50 @@ export class LoginModal extends Modal {
 	}
 }
 
-export class RepoPicker extends SuggestModal<RepoInfo> {
+/** GitHub's "new app" form, pre-filled: private, no webhook, read/write access to file contents only. */
+function newAppUrl(name: string): string {
+	const params = new URLSearchParams({
+		name,
+		description: "Syncs my Obsidian vault with GitHub (Simple Git Sync plugin).",
+		url: "https://github.com/michaelenew/obsidian-git-plugin",
+		public: "false",
+		webhook_active: "false",
+		contents: "write",
+	});
+	return `https://github.com/settings/apps/new?${params}`;
+}
+
+type RepoChoice = RepoInfo | "install";
+
+export class RepoPicker extends SuggestModal<RepoChoice> {
 	constructor(
 		app: App,
 		private repos: RepoInfo[],
 		private onPick: (r: RepoInfo) => void,
+		private onInstall: () => void,
 	) {
 		super(app);
-		this.setPlaceholder("Which repository holds this vault?");
+		this.setPlaceholder(repos.length ? "Which repository holds this vault?" : "Your sync app can't see any repositories yet");
 	}
 
-	getSuggestions(query: string): RepoInfo[] {
+	getSuggestions(query: string): RepoChoice[] {
 		const q = query.toLowerCase();
-		return this.repos.filter((r) => r.fullName.toLowerCase().includes(q));
+		return [...this.repos.filter((r) => r.fullName.toLowerCase().includes(q)), "install"];
 	}
 
-	renderSuggestion(r: RepoInfo, el: HTMLElement) {
+	renderSuggestion(r: RepoChoice, el: HTMLElement) {
+		if (r === "install") {
+			el.createEl("div", { text: "Give the sync app access to a repository…" });
+			el.createEl("small", { text: "Opens GitHub. Pick “Only select repositories” and choose your vault repository.", cls: "sgs-muted" });
+			return;
+		}
 		el.createEl("div", { text: r.fullName });
 		el.createEl("small", { text: `${r.private ? "private" : "public"} · ${r.defaultBranch}`, cls: "sgs-muted" });
 	}
 
-	onChooseSuggestion(r: RepoInfo) {
-		this.onPick(r);
+	onChooseSuggestion(r: RepoChoice) {
+		if (r === "install") this.onInstall();
+		else this.onPick(r);
 	}
 }
 
@@ -335,7 +415,7 @@ export class SettingsTab extends PluginSettingTab {
 
 		new Setting(el)
 			.setName("GitHub App client ID")
-			.setDesc("Only needed if this build doesn't include one. Public, not a secret.")
+			.setDesc("Your sync app on GitHub, set up when you first log in. Stored on this device only. Clear it to run the setup again.")
 			.addText((t) =>
 				t.setValue(s.clientId).onChange(async (v) => {
 					s.clientId = v.trim();
