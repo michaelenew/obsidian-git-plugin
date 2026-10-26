@@ -112,6 +112,10 @@ export class Auth {
 			refresh_token: c.refresh,
 		});
 		if (!j.access_token) {
+			// Renewal tokens work once. If another copy of the plugin (e.g. the old one, mid-update)
+			// renewed first, the stored login is already the new one: use it.
+			const latest = this.load();
+			if (latest?.refresh && latest.refresh !== c.refresh) return latest.access;
 			throw new AuthError(`GitHub refused to renew the login: ${j.error_description ?? j.error ?? "no reason given"}${j.error ? ` (${j.error})` : ""}`);
 		}
 		const next = credentialsFrom(j);

@@ -387,7 +387,8 @@ export default class SimpleGitSync extends Plugin {
 	private loginExpired(reason: string) {
 		this.setCredentials(null);
 		this.setPhase("logged-out", reason);
-		new Notice("Git sync: your GitHub login expired. Please log in again.", 10000);
+		// Stays until dismissed, with GitHub's reason, so the cause can be reported.
+		new Notice(`Git sync: please log in to GitHub again.\n\nReason: ${reason}`, 0);
 		this.login();
 	}
 
