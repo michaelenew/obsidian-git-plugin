@@ -101,6 +101,8 @@ export interface SyncResult {
 	skipped: string[];
 	/** Files GitHub wouldn't take this time; everything else was synced. Retried next sync. */
 	failed: SyncFailure[];
+	/** A pull that found nothing new on GitHub and didn't look at files at all */
+	unchanged?: boolean;
 }
 
 /** A non-text file (or a text file over 1 MB) waiting to be pushed in its own commit. */
@@ -211,7 +213,10 @@ export class SyncEngine {
 		const result: SyncResult = {
 			mode, head, commit: null, pulled: [], pushed: [], merged: [], conflicts: [], skipped: [], failed: [],
 		};
-		if (mode === "pull" && head === this.settledHead) return { result, attachments: [], head: { commit: head, treeSha: "" } };
+		if (mode === "pull" && head === this.settledHead) {
+			result.unchanged = true;
+			return { result, attachments: [], head: { commit: head, treeSha: "" } };
+		}
 
 		const tree = await this.getTree(head);
 		const local = await this.scanLocal();

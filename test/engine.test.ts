@@ -518,3 +518,15 @@ test("a file this device can't save is reported; everything else still syncs", a
 	assert.equal(gh.files()["Meeting 10:30.md"], "colon");
 	assert.equal(gh.files()["new.md"], "x");
 });
+
+test("a pull that finds nothing new says so, instead of reporting no failures", async () => {
+	const gh = new FakeGitHub();
+	await gh.seed({ "ok.md": "fine", "Plan?.md": "q" });
+	const disk = new FakeDisk();
+	(disk as any).nameProblem = (p: string) => (p.includes("?") ? "bad name" : null);
+	const { engine } = device(gh, "phone", disk);
+	const first = await engine.sync("full");
+	assert.deepEqual(first.failed.map((f) => f.path), ["Plan?.md"]);
+	const quick = await engine.sync("pull");
+	assert.equal(quick.unchanged, true);
+});
