@@ -1,5 +1,5 @@
 import { Notice, Platform, Plugin, TAbstractFile, TFile } from "obsidian";
-import { Change, emptyState, Mode, SyncEngine, SyncResult, SyncState } from "./engine";
+import { Change, emptyState, Mode, SyncEngine, SyncFailure, SyncResult, SyncState } from "./engine";
 import { Auth, AuthError, Credentials, isOffline, NetworkError } from "./auth";
 import { GitHub } from "./github";
 import { InstallModal, LoginModal, PANEL_VIEW, RepoPicker, SettingsTab, SyncPanel } from "./ui";
@@ -57,7 +57,7 @@ export interface Status {
 	lastResult: SyncResult | null;
 	conflicts: string[];
 	/** Files the last full sync couldn't upload, with GitHub's answer */
-	failed: Array<{ path: string; error: string }>;
+	failed: SyncFailure[];
 	log: Array<{ at: Date; text: string }>;
 }
 
@@ -289,23 +289,21 @@ export default class SimpleGitSync extends Plugin {
 		if (r.merged.length) parts.push(`merged ${r.merged.length}`);
 		if (r.pushed.length) parts.push(`pushed ${r.pushed.length}`);
 		if (parts.length) this.addLog(`${parts.join(", ")}${r.commit ? ` (${r.commit.slice(0, 7)})` : ""}`);
-		this.status.failed = r.mode === "full" ? r.failed : this.status.failed;
-		if (r.failed.length) {
-			// Stays up until dismissed, and only reappears if the set of failures changes.
-			const key = r.failed.map((f) => f.error).join("\n");
-			if (key !== this.lastFailedShown) {
-				const n = r.failed.length;
-				new Notice(
-					`Git sync: ${n === 1 ? "1 file wasn't" : `${n} files weren't`} sent to GitHub. Everything else synced. ` +
-						`${n === 1 ? "It stays" : "They stay"} on this device and will be retried each sync.\n\n` +
-						r.failed.map((f) => `• ${f.error}`).join("\n\n"),
-					0,
-				);
-				this.lastFailedShown = key;
-			}
-		} else if (r.mode === "full") {
-			this.lastFailedShown = "";
+		// Uploads are only tried in full syncs, so a pull keeps the last full sync's upload failures.
+		const ups = (r.mode === "full" ? r.failed : this.status.failed).filter((f) => f.direction === "up");
+		this.status.failed = [...ups, ...r.failed.filter((f) => f.direction === "down")];
+		const failed = this.status.failed;
+		// Stays up until dismissed, and only reappears if the set of failures changes.
+		const key = failed.map((f) => f.error).join("\n");
+		if (failed.length && key !== this.lastFailedShown) {
+			const n = failed.length;
+			new Notice(
+				`Git sync: ${n === 1 ? "1 file" : `${n} files`} couldn't be synced. Everything else synced, and nothing was lost.\n\n` +
+					failed.map((f) => `• ${f.error}`).join("\n\n"),
+				0,
+			);
 		}
+		this.lastFailedShown = key;
 		if (r.conflicts.length) {
 			this.status.conflicts = [...new Set([...r.conflicts, ...this.status.conflicts])].slice(0, 50);
 			this.addLog(`kept both versions: ${r.conflicts.join(", ")}`);
@@ -582,6 +580,6 @@ export function statusLine(p: SimpleGitSync): string {
 		case "syncing": return `Git: ${p.status.message || "syncing…"}`;
 		case "offline": return `Git: offline${p.dirtyCount() ? ` · ${p.dirtyCount()} unpushed` : ""}`;
 		case "error": return "Git: sync error";
-		default: return `Git: synced ${ago(p.status.lastSync)}${p.dirtyCount() ? ` · ${p.dirtyCount()} unpushed` : ""}${p.status.failed.length ? ` · ${p.status.failed.length} not sent` : ""}`;
+		default: return `Git: synced ${ago(p.status.lastSync)}${p.dirtyCount() ? ` · ${p.dirtyCount()} unpushed` : ""}${p.status.failed.length ? ` · ${p.status.failed.length} not synced` : ""}`;
 	}
 }

@@ -279,7 +279,7 @@ export class SyncPanel extends ItemView {
 
 		section(el, `Not yet pushed (${this.pending.length})`, this.pending.map((c) => ({ path: c.path, note: c.kind })), this.app);
 		if (status.failed.length) {
-			el.createEl("h6", { text: `Not sent to GitHub (${status.failed.length}): kept on this device, retried each sync` });
+			el.createEl("h6", { text: `Not synced (${status.failed.length}): retried each sync` });
 			const list = el.createDiv("sgs-list");
 			for (const f of status.failed) list.createDiv({ text: f.error, cls: "sgs-error" });
 		}
@@ -310,7 +310,7 @@ function panelReport(plugin: SimpleGitSync, pending: Change[]): string {
 		`Last sync: ${status.lastSync?.toLocaleString() ?? "never"}${r ? `; GitHub at ${(r.commit ?? r.head).slice(0, 7)}; pulled ${r.pulled.length}, pushed ${r.pushed.length}, merged ${r.merged.length}, skipped ${r.skipped.length}` : ""}`,
 		`Not yet pushed: ${pending.length}`,
 	];
-	if (status.failed.length) lines.push("", "Not sent to GitHub:", ...status.failed.map((f) => `  ${f.error}`));
+	if (status.failed.length) lines.push("", "Not synced:", ...status.failed.map((f) => `  ${f.error}`));
 	if (status.conflicts.length) lines.push("", "Kept both versions:", ...status.conflicts.map((c) => `  ${c}`));
 	lines.push("", "Activity (newest first):", ...status.log.map((e) => `  ${e.at.toLocaleString()}  ${e.text}`));
 	return lines.join("\n");

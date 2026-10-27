@@ -1,5 +1,5 @@
 import ignore, { Ignore } from "ignore";
-import { App, normalizePath, TFile, TFolder } from "obsidian";
+import { App, normalizePath, Platform, TFile, TFolder } from "obsidian";
 import type { LocalEntry, LocalStore } from "./engine";
 
 export interface VaultStoreOptions {
@@ -51,6 +51,15 @@ export class VaultStore implements LocalStore {
 		} catch {
 			return false;
 		}
+	}
+
+	/** Android, iOS and Windows don't allow these in file or folder names; macOS and GitHub do. */
+	nameProblem(path: string): string | null {
+		if (!(Platform.isMobile || Platform.isWin)) return null;
+		const bad = [...new Set([...path.replace(/\//g, "")].filter((ch) => '*"\\<>:|?'.includes(ch)))];
+		if (!bad.length) return null;
+		const system = Platform.isAndroidApp ? "Android" : Platform.isIosApp ? "iOS" : Platform.isWin ? "Windows" : "this device";
+		return `its name contains ${bad.map((c) => `"${c}"`).join(" ")}, which ${system} doesn't allow in file names`;
 	}
 
 	async list(): Promise<LocalEntry[]> {

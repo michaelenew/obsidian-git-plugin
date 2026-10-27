@@ -33,6 +33,8 @@ export interface LocalStore {
 	exists(path: string): Promise<boolean>;
 	/** Paths this device never touches, on either side. Valid after list(). */
 	isExcluded(path: string): boolean;
+	/** Why this path can't exist on this device (e.g. a character Android forbids), or null. */
+	nameProblem?(path: string): string | null;
 }
 
 export interface RemoteEntry {
@@ -98,7 +100,7 @@ export interface SyncResult {
 	/** remote changes held back because the local file changed mid-sync or (pull mode) also changed locally */
 	skipped: string[];
 	/** Files GitHub wouldn't take this time; everything else was synced. Retried next sync. */
-	failed: Array<{ path: string; error: string }>;
+	failed: SyncFailure[];
 }
 
 /** A non-text file (or a text file over 1 MB) waiting to be pushed in its own commit. */
@@ -114,6 +116,16 @@ interface Head {
 	commit: string;
 	treeSha: string;
 }
+
+export interface SyncFailure {
+	path: string;
+	error: string;
+	/** "up": couldn't be sent to GitHub; "down": couldn't be saved on this device */
+	direction: "up" | "down";
+}
+
+/** Errors that mean "stop the whole sync", as opposed to "this one file failed". */
+const FATAL_ERRORS = new Set(["NetworkError", "AuthError", "StoppedError"]);
 
 export interface EngineOptions {
 	branch: string;
@@ -218,25 +230,50 @@ export class SyncEngine {
 		let settled = true;
 
 		const work: Array<() => Promise<void>> = [];
+		// A file that can't be saved here (bad name, disk full, ...) is reported; the rest still syncs.
+		const safely = (path: string, task: () => Promise<void>) => async () => {
+			try {
+				await task();
+			} catch (e) {
+				if (e instanceof Error && FATAL_ERRORS.has(e.name)) throw e;
+				settled = false;
+				const error = `Couldn't save "${path}" on this device: ${e instanceof Error ? e.message : e}`;
+				this.log(error);
+				result.failed.push({ path, error, direction: "down" });
+			}
+		};
 		for (const path of paths) {
 			if (this.local.isExcluded(path)) continue;
 			const b = base[path];
 			const l = local.get(path);
 			const r = remote.get(path)?.sha;
 
+			// Can never exist on this device: say so once per sync, don't download it.
+			const problem = l === undefined && r !== undefined ? this.local.nameProblem?.(path) : null;
+			if (problem) {
+				result.failed.push({
+					path,
+					error: `"${path}" can't be stored on this device: ${problem}. Rename it on another device to sync it here; it is safe on GitHub.`,
+					direction: "down",
+				});
+				continue;
+			}
+
 			if (l === r) {
 				setBase(path, r);
 			} else if (l === b) {
 				// Only GitHub changed it.
-				work.push(async () => {
-					if (await this.applyRemote(path, l, r)) {
-						setBase(path, r);
-						result.pulled.push(path);
-					} else {
-						settled = false;
-						result.skipped.push(path);
-					}
-				});
+				work.push(
+					safely(path, async () => {
+						if (await this.applyRemote(path, l, r)) {
+							setBase(path, r);
+							result.pulled.push(path);
+						} else {
+							settled = false;
+							result.skipped.push(path);
+						}
+					}),
+				);
 			} else if (r === b) {
 				// Only this device changed it.
 				toPush.add(path);
@@ -246,38 +283,42 @@ export class SyncEngine {
 				result.skipped.push(path);
 			} else if (l === undefined) {
 				// Deleted here, edited elsewhere: keep the edit.
-				work.push(async () => {
-					if (await this.applyRemote(path, l, r)) {
-						setBase(path, r);
-						result.pulled.push(path);
-					} else {
-						settled = false;
-						result.skipped.push(path);
-					}
-				});
+				work.push(
+					safely(path, async () => {
+						if (await this.applyRemote(path, l, r)) {
+							setBase(path, r);
+							result.pulled.push(path);
+						} else {
+							settled = false;
+							result.skipped.push(path);
+						}
+					}),
+				);
 			} else if (r === undefined) {
 				// Edited here, deleted elsewhere: keep the edit.
 				setBase(path, undefined);
 				toPush.add(path);
 			} else {
-				work.push(async () => {
-					const outcome = await this.mergeBoth(path, b, l, r);
-					if (!outcome) {
-						settled = false;
-						result.skipped.push(path);
-						return;
-					}
-					setBase(path, r);
-					toPush.add(path);
-					if (outcome.copyPath) {
-						toPush.add(outcome.copyPath);
-						result.conflicts.push(outcome.copyPath);
-					} else if (outcome.conflict) {
-						result.conflicts.push(path);
-					} else {
-						result.merged.push(path);
-					}
-				});
+				work.push(
+					safely(path, async () => {
+						const outcome = await this.mergeBoth(path, b, l, r);
+						if (!outcome) {
+							settled = false;
+							result.skipped.push(path);
+							return;
+						}
+						setBase(path, r);
+						toPush.add(path);
+						if (outcome.copyPath) {
+							toPush.add(outcome.copyPath);
+							result.conflicts.push(outcome.copyPath);
+						} else if (outcome.conflict) {
+							result.conflicts.push(path);
+						} else {
+							result.merged.push(path);
+						}
+					}),
+				);
 			}
 		}
 		let done = 0;
@@ -347,7 +388,7 @@ export class SyncEngine {
 				}
 				const error = `Couldn't sync attachment "${path}" (${size}): ${e instanceof Error ? e.message : e}`;
 				this.log(error);
-				result.failed.push({ path, error });
+				result.failed.push({ path, error, direction: "up" });
 			}
 		}
 	}
@@ -415,7 +456,7 @@ export class SyncEngine {
 				} else if (data.length > MAX_FILE) {
 					const error = `Couldn't sync "${path}" (${formatSize(data.length)}): GitHub doesn't accept files over 100 MB`;
 					this.log(error);
-					result.failed.push({ path, error });
+					result.failed.push({ path, error, direction: "up" });
 				} else {
 					attachments.push({ change, kind, data, remoteSha: r?.sha });
 				}

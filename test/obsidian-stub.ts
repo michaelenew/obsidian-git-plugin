@@ -6,3 +6,4 @@ export class App {}
 // Tests install a fake network on globalThis.__requestUrl.
 export const requestUrl = (req: any) => (globalThis as any).__requestUrl(req);
 export const arrayBufferToBase64 = (b: ArrayBuffer) => Buffer.from(b).toString("base64");
+export const Platform = { isMobile: false, isWin: false, isAndroidApp: false, isIosApp: false };

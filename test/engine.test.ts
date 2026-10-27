@@ -374,7 +374,7 @@ test("losing the connection mid-download stops cleanly and the next sync finishe
 	const getBlob = gh.getBlob.bind(gh);
 	let calls = 0;
 	gh.getBlob = async (sha) => {
-		if (++calls === 10) throw new Error("network down");
+		if (++calls === 10) throw Object.assign(new Error("network down"), { name: "NetworkError" });
 		return getBlob(sha);
 	};
 	await assert.rejects(engine.sync("full"), /network down/);
@@ -488,4 +488,33 @@ test("an upload that times out while GitHub is still reachable fails only that f
 	const r = await engine.sync("full");
 	assert.deepEqual(r.failed.map((f) => f.path), ["slow.m4a"]);
 	assert.equal(gh.files()["note.md"], "text");
+});
+
+test("a file this device can't save is reported; everything else still syncs", async () => {
+	const gh = new FakeGitHub();
+	await gh.seed({ "ok.md": "fine", "Meeting 10:30.md": "colon", "big.md": "disk full" });
+	const disk = new FakeDisk();
+	(disk as any).nameProblem = (p: string) => (p.includes(":") ? 'its name contains ":", which Android doesn\'t allow in file names' : null);
+	const write = disk.write.bind(disk);
+	disk.write = async (p, d) => {
+		if (p === "big.md") throw new Error("No space left on device");
+		return write(p, d);
+	};
+	const { engine, state } = device(gh, "phone", disk);
+	let blobs = 0;
+	const getBlob = gh.getBlob.bind(gh);
+	gh.getBlob = async (sha) => (blobs++, getBlob(sha));
+	const r = await engine.sync("full");
+	assert.equal(disk.get("ok.md"), "fine");
+	assert.deepEqual(r.failed.map((f) => [f.path, f.direction]).sort(), [["Meeting 10:30.md", "down"], ["big.md", "down"]]);
+	assert.match(r.failed.find((f) => f.path === "Meeting 10:30.md")!.error, /can't be stored on this device: its name contains ":", which Android doesn't allow in file names\. Rename it on another device/);
+	assert.match(r.failed.find((f) => f.path === "big.md")!.error, /^Couldn't save "big\.md" on this device: No space left on device$/);
+	assert.equal(blobs, 2, "the unstorable name isn't even downloaded");
+	assert.equal(state.base["Meeting 10:30.md"], undefined);
+
+	// Nothing is deleted on GitHub because of it.
+	disk.put("new.md", "x");
+	await engine.sync("full");
+	assert.equal(gh.files()["Meeting 10:30.md"], "colon");
+	assert.equal(gh.files()["new.md"], "x");
 });
