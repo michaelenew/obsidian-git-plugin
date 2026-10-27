@@ -298,6 +298,23 @@ function apiError(res: RequestUrlResponse, method: string, path: string): Error 
 	return new Error(what);
 }
 
+/** Sleep, but wake early when Obsidian comes back to the foreground. */
+function waitOrReturn(ms: number): Promise<void> {
+	return new Promise((resolve) => {
+		const hasDocument = typeof document !== "undefined";
+		const done = () => {
+			clearTimeout(timer);
+			if (hasDocument) document.removeEventListener("visibilitychange", onVisible);
+			resolve();
+		};
+		const onVisible = () => {
+			if (document.visibilityState === "visible") done();
+		};
+		const timer = setTimeout(done, ms);
+		if (hasDocument) document.addEventListener("visibilitychange", onVisible);
+	});
+}
+
 /*
  * GitHub "device flow" login: GitHub shows the user a short code, the user
  * types it at github.com/login/device, and we receive a token. Nothing to
@@ -324,16 +341,33 @@ export async function startDeviceLogin(clientId: string): Promise<DeviceCode> {
 }
 
 /** Wait for the user to approve the code. */
-export async function waitForDeviceLogin(clientId: string, code: DeviceCode, cancelled: () => boolean): Promise<Credentials> {
+export async function waitForDeviceLogin(
+	clientId: string,
+	code: DeviceCode,
+	cancelled: () => boolean,
+	onStatus: (msg: string) => void = () => {},
+): Promise<Credentials> {
 	let interval = code.interval;
 	while (Date.now() < code.expiresAt) {
-		await new Promise((r) => setTimeout(r, interval * 1000));
+		await waitOrReturn(interval * 1000);
 		if (cancelled()) throw new Error("cancelled");
-		const j = await postForm(`${WEB}/login/oauth/access_token`, {
-			client_id: clientId,
-			device_code: code.deviceCode,
-			grant_type: "urn:ietf:params:oauth:grant-type:device_code",
-		});
+		// While the user is in the browser approving, Android often cuts a background
+		// app's network. Don't ask until Obsidian is back in front; then ask right away.
+		if (typeof document !== "undefined" && document.visibilityState === "hidden") continue;
+		let j;
+		try {
+			j = await postForm(`${WEB}/login/oauth/access_token`, {
+				client_id: clientId,
+				device_code: code.deviceCode,
+				grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+			});
+		} catch (e) {
+			// A connection hiccup isn't an answer; keep waiting until the code expires.
+			if (!(e instanceof NetworkError)) throw e;
+			onStatus(`Can't reach GitHub right now (${e.message}). Still waiting; check your connection.`);
+			continue;
+		}
+		onStatus("Waiting for approval…");
 		if (j.access_token) return credentialsFrom(j);
 		if (j.error === "slow_down") interval = (j.interval ?? interval + 5);
 		else if (j.error !== "authorization_pending") throw new Error(j.error_description ?? j.error);
