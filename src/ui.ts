@@ -44,7 +44,7 @@ export class LoginModal extends Modal {
 				}),
 			);
 			const waiting = el.createEl("p", { text: "Waiting for approval…", cls: "sgs-muted" });
-			const credentials = await waitForDeviceLogin(clientId, code, () => this.cancelled);
+			const credentials = await waitForDeviceLogin(clientId, code, () => this.cancelled, (msg) => waiting.setText(msg));
 			waiting.setText("Logged in.");
 			await this.onLogin(credentials);
 			this.close();

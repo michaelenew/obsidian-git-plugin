@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Auth, AuthError, Credentials, NetworkError, StoppedError } from "../src/auth";
-import { GitHub } from "../src/github";
+import { GitHub, waitForDeviceLogin } from "../src/github";
 
 const HOUR = 3600_000;
 
@@ -188,4 +188,19 @@ test("after the plugin unloads, leftover work gets no token and never renews or 
 	await assert.rejects(new GitHub(auth, "o/r").user(), StoppedError);
 	assert.equal(calls.refresh + calls.api, 0);
 	assert.equal(get()!.refresh, "refresh-0");
+});
+
+test("device login keeps waiting through connection hiccups", async () => {
+	const answers: Array<() => any> = [
+		() => { throw new Error("Unable to resolve host \"github.com\": No address associated with hostname"); },
+		() => ({ status: 200, json: { error: "authorization_pending" } }),
+		() => ({ status: 200, json: { access_token: "gho_new", refresh_token: "ghr_new", expires_in: 28800 } }),
+	];
+	(globalThis as any).__requestUrl = async () => answers.shift()!();
+	const notes: string[] = [];
+	const code = { deviceCode: "d", userCode: "U", verificationUri: "https://github.com/login/device", interval: 0, expiresAt: Date.now() + 60_000 };
+	const c = await waitForDeviceLogin("Iv1.test", code, () => false, (m) => notes.push(m));
+	assert.equal(c.access, "gho_new");
+	assert.match(notes[0], /^Can't reach GitHub right now \(Couldn't reach GitHub's login service: Unable to resolve host/);
+	assert.equal(notes[1], "Waiting for approval…");
 });
