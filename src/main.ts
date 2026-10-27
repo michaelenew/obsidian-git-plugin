@@ -2,6 +2,7 @@ import { Notice, Platform, Plugin, TAbstractFile, TFile } from "obsidian";
 import { Change, emptyState, Mode, SyncEngine, SyncFailure, SyncResult, SyncState } from "./engine";
 import { Auth, AuthError, Credentials, isOffline, NetworkError } from "./auth";
 import { GitHub } from "./github";
+import { unannounced } from "./notify";
 import { InstallModal, LoginModal, PANEL_VIEW, RepoPicker, SettingsTab, SyncPanel } from "./ui";
 import { VaultStore } from "./vaultStore";
 
@@ -94,6 +95,7 @@ export default class SimpleGitSync extends Plugin {
 		const data = (await this.loadData()) ?? {};
 		this.settings = { ...DEFAULTS, deviceName: defaultDeviceName(), ...data.settings };
 		this.state = data.state ?? emptyState(this.target());
+		this.notified = new Set(data.notified ?? []);
 		await this.save();
 
 		this.registerView(PANEL_VIEW, (leaf) => new SyncPanel(leaf, this));
@@ -272,8 +274,10 @@ export default class SimpleGitSync extends Plugin {
 			} else {
 				this.setPhase("error", msg);
 				// Show each new problem once, even for background syncs.
-				if (manual || msg !== this.lastErrorShown) new Notice(`Git sync failed: ${msg}`, 15000);
-				this.lastErrorShown = msg;
+				// Compare without GitHub's request id, which differs on every attempt.
+				const same = msg.replace(/\s*\[request [^\]]*\]/g, "");
+				if (manual || same !== this.lastErrorShown) new Notice(`Git sync failed: ${msg}`, 15000);
+				this.lastErrorShown = same;
 			}
 		} finally {
 			this.running = false;
@@ -289,21 +293,13 @@ export default class SimpleGitSync extends Plugin {
 		if (r.merged.length) parts.push(`merged ${r.merged.length}`);
 		if (r.pushed.length) parts.push(`pushed ${r.pushed.length}`);
 		if (parts.length) this.addLog(`${parts.join(", ")}${r.commit ? ` (${r.commit.slice(0, 7)})` : ""}`);
-		// Uploads are only tried in full syncs, so a pull keeps the last full sync's upload failures.
-		const ups = (r.mode === "full" ? r.failed : this.status.failed).filter((f) => f.direction === "up");
-		this.status.failed = [...ups, ...r.failed.filter((f) => f.direction === "down")];
-		const failed = this.status.failed;
-		// Stays up until dismissed, and only reappears if the set of failures changes.
-		const key = failed.map((f) => f.error).join("\n");
-		if (failed.length && key !== this.lastFailedShown) {
-			const n = failed.length;
-			new Notice(
-				`Git sync: ${n === 1 ? "1 file" : `${n} files`} couldn't be synced. Everything else synced, and nothing was lost.\n\n` +
-					failed.map((f) => `• ${f.error}`).join("\n\n"),
-				0,
-			);
+		// A pull that found nothing new checked no files, so the known failures still stand.
+		if (!r.unchanged) {
+			// Uploads are only tried in full syncs, so a pull keeps the last full sync's upload failures.
+			const ups = (r.mode === "full" ? r.failed : this.status.failed).filter((f) => f.direction === "up");
+			this.status.failed = [...ups, ...r.failed.filter((f) => f.direction === "down")];
+			this.notifyFailures(this.status.failed);
 		}
-		this.lastFailedShown = key;
 		if (r.conflicts.length) {
 			this.status.conflicts = [...new Set([...r.conflicts, ...this.status.conflicts])].slice(0, 50);
 			this.addLog(`kept both versions: ${r.conflicts.join(", ")}`);
@@ -512,7 +508,24 @@ export default class SimpleGitSync extends Plugin {
 	private active = true;
 	/** Whether the login should be in storage, to notice if it vanishes without us removing it. */
 	private expectLogin = false;
-	private lastFailedShown = "";
+	/** Files already announced as failing ("up:path" / "down:path"), kept across restarts. */
+	private notified = new Set<string>();
+
+	/** One notice per failing file, until it syncs again; see unannounced(). */
+	private notifyFailures(failed: SyncFailure[]) {
+		const { fresh, notified } = unannounced(this.notified, failed);
+		const changed = notified.size !== this.notified.size || [...notified].some((k) => !this.notified.has(k));
+		this.notified = notified;
+		if (changed) void this.save();
+		if (!fresh.length) return;
+		const older = failed.length - fresh.length;
+		new Notice(
+			`Git sync: ${fresh.length === 1 ? "1 file" : `${fresh.length} files`} couldn't be synced. Everything else synced, and nothing was lost.\n\n` +
+				fresh.map((f) => `• ${f.error}`).join("\n\n") +
+				(older ? `\n\n(${older} more, already reported, are listed in the sync panel.)` : ""),
+			0,
+		);
+	}
 
 	/** Show what a long sync is doing, without redrawing the panel on every file. */
 	private progress(message: string) {
@@ -561,7 +574,7 @@ export default class SimpleGitSync extends Plugin {
 	async save() {
 		// An unloaded copy's state is out of date; the new copy owns data.json now.
 		if (!this.active) return;
-		await this.saveData({ settings: this.settings, state: this.state });
+		await this.saveData({ settings: this.settings, state: this.state, notified: [...this.notified] });
 	}
 }
 
