@@ -40,6 +40,8 @@ export interface LocalStore {
 export interface RemoteEntry {
 	sha: string;
 	mode: string;
+	/** bytes, when GitHub says */
+	size?: number;
 }
 
 export interface RemoteTree {
@@ -109,7 +111,8 @@ export interface SyncResult {
 interface Attachment {
 	change: TreeChange;
 	kind: ChangeKind;
-	data: Uint8Array;
+	/** Not the data itself: holding every attachment in memory at once crashed phones. */
+	size: number;
 	/** GitHub's version when this sync started; if it changes before we push, we back off */
 	remoteSha: string | undefined;
 }
@@ -142,6 +145,13 @@ export interface EngineOptions {
 	log?: (msg: string) => void;
 	/** Short progress text for long syncs, e.g. "uploading 120 of 400" */
 	progress?: (msg: string) => void;
+	/**
+	 * Roughly how many bytes of files to handle at once. Phones have little memory, and
+	 * on mobile every file crosses into the app as text several times its size.
+	 */
+	memoryBudget?: number;
+	/** Don't download files bigger than this to this device (bytes); null for no limit. */
+	maxDownloadSize?: number | null;
 }
 
 const MAX_ATTEMPTS = 4;
@@ -158,6 +168,8 @@ const MAX_FILE = 100 * 1024 * 1024;
 
 export class SyncEngine {
 	private treeCache: { commit: string; tree: RemoteTree } | null = null;
+	/** files read during the last scan because their size or date changed */
+	private rehashed = 0;
 	/** head whose changes are all already on this device; lets a pull with nothing new cost one request */
 	private settledHead: string | null = null;
 
@@ -173,6 +185,10 @@ export class SyncEngine {
 
 	private log(msg: string) {
 		this.opts.log?.(msg);
+	}
+
+	private budget(): number {
+		return this.opts.memoryBudget ?? 64 * 1024 * 1024;
 	}
 
 	async sync(mode: Mode): Promise<SyncResult> {
@@ -220,6 +236,8 @@ export class SyncEngine {
 
 		const tree = await this.getTree(head);
 		const local = await this.scanLocal();
+		// Reading every file is the slow part; keep the result even if the app is killed later.
+		if (this.rehashed > 20) await this.opts.saveState();
 		const remote = new Map<string, RemoteEntry>();
 		for (const [path, entry] of tree.entries) {
 			if (!this.local.isExcluded(path)) remote.set(path, entry);
@@ -235,23 +253,39 @@ export class SyncEngine {
 		let settled = true;
 
 		const work: Array<() => Promise<void>> = [];
+		const weights: number[] = [];
 		// A file that can't be saved here (bad name, disk full, ...) is reported; the rest still syncs.
-		const safely = (path: string, task: () => Promise<void>) => async () => {
-			try {
-				await task();
-			} catch (e) {
-				if (e instanceof Error && FATAL_ERRORS.has(e.name)) throw e;
-				settled = false;
-				const error = `Couldn't save "${path}" on this device: ${e instanceof Error ? e.message : e}`;
-				this.log(error);
-				result.failed.push({ path, error, direction: "down" });
-			}
+		const schedule = (path: string, task: () => Promise<void>) => {
+			weights.push(remote.get(path)?.size ?? 0);
+			work.push(async () => {
+				try {
+					await task();
+				} catch (e) {
+					if (e instanceof Error && FATAL_ERRORS.has(e.name)) throw e;
+					settled = false;
+					const error = `Couldn't save "${path}" on this device: ${e instanceof Error ? e.message : e}`;
+					this.log(error);
+					result.failed.push({ path, error, direction: "down" });
+				}
+			});
 		};
+		const maxDownload = this.opts.maxDownloadSize;
 		for (const path of paths) {
 			if (this.local.isExcluded(path)) continue;
 			const b = base[path];
 			const l = local.get(path);
 			const r = remote.get(path)?.sha;
+
+			// Changed on GitHub but too big for this device: leave it there, keep the local copy.
+			const size = remote.get(path)?.size ?? 0;
+			if (r !== undefined && r !== b && l !== r && maxDownload && size > maxDownload) {
+				result.failed.push({
+					path,
+					error: `"${path}" (${formatSize(size)}) is bigger than this device's download limit (${formatSize(maxDownload)}), so it stays on GitHub. You can raise the limit in Settings → Simple Git Sync.`,
+					direction: "down",
+				});
+				continue;
+			}
 
 			// Can never exist on this device: say so once per sync, don't download it.
 			const problem = l === undefined && r !== undefined ? this.local.nameProblem?.(path) : null;
@@ -268,17 +302,15 @@ export class SyncEngine {
 				setBase(path, r);
 			} else if (l === b) {
 				// Only GitHub changed it.
-				work.push(
-					safely(path, async () => {
-						if (await this.applyRemote(path, l, r)) {
-							setBase(path, r);
-							result.pulled.push(path);
-						} else {
-							settled = false;
-							result.skipped.push(path);
-						}
-					}),
-				);
+				schedule(path, async () => {
+					if (await this.applyRemote(path, l, r)) {
+						setBase(path, r);
+						result.pulled.push(path);
+					} else {
+						settled = false;
+						result.skipped.push(path);
+					}
+				});
 			} else if (r === b) {
 				// Only this device changed it.
 				toPush.add(path);
@@ -288,42 +320,38 @@ export class SyncEngine {
 				result.skipped.push(path);
 			} else if (l === undefined) {
 				// Deleted here, edited elsewhere: keep the edit.
-				work.push(
-					safely(path, async () => {
-						if (await this.applyRemote(path, l, r)) {
-							setBase(path, r);
-							result.pulled.push(path);
-						} else {
-							settled = false;
-							result.skipped.push(path);
-						}
-					}),
-				);
+				schedule(path, async () => {
+					if (await this.applyRemote(path, l, r)) {
+						setBase(path, r);
+						result.pulled.push(path);
+					} else {
+						settled = false;
+						result.skipped.push(path);
+					}
+				});
 			} else if (r === undefined) {
 				// Edited here, deleted elsewhere: keep the edit.
 				setBase(path, undefined);
 				toPush.add(path);
 			} else {
-				work.push(
-					safely(path, async () => {
-						const outcome = await this.mergeBoth(path, b, l, r);
-						if (!outcome) {
-							settled = false;
-							result.skipped.push(path);
-							return;
-						}
-						setBase(path, r);
-						toPush.add(path);
-						if (outcome.copyPath) {
-							toPush.add(outcome.copyPath);
-							result.conflicts.push(outcome.copyPath);
-						} else if (outcome.conflict) {
-							result.conflicts.push(path);
-						} else {
-							result.merged.push(path);
-						}
-					}),
-				);
+				schedule(path, async () => {
+					const outcome = await this.mergeBoth(path, b, l, r);
+					if (!outcome) {
+						settled = false;
+						result.skipped.push(path);
+						return;
+					}
+					setBase(path, r);
+					toPush.add(path);
+					if (outcome.copyPath) {
+						toPush.add(outcome.copyPath);
+						result.conflicts.push(outcome.copyPath);
+					} else if (outcome.conflict) {
+						result.conflicts.push(path);
+					} else {
+						result.merged.push(path);
+					}
+				});
 			}
 		}
 		let done = 0;
@@ -333,6 +361,8 @@ export class SyncEngine {
 				if (work.length > 10) this.opts.progress?.(`downloading ${++done} of ${work.length}`);
 			}),
 			CONCURRENCY,
+			this.budget(),
+			weights,
 		);
 
 		const { changes, attachments } =
@@ -370,11 +400,11 @@ export class SyncEngine {
 
 	/** One commit per attachment, smallest first. A failure is reported for that file only. */
 	private async pushAttachments(attachments: Attachment[], head: Head, result: SyncResult): Promise<void> {
-		attachments.sort((a, b) => a.data.length - b.data.length);
+		attachments.sort((a, b) => a.size - b.size);
 		let n = 0;
 		for (const a of attachments) {
 			const { path } = a.change;
-			const size = formatSize(a.data.length);
+			const size = formatSize(a.size);
 			this.opts.progress?.(`uploading attachment ${++n} of ${attachments.length} (${path.split("/").pop()}, ${size})`);
 			try {
 				const next = await this.pushAttachment(a, head, result);
@@ -401,11 +431,17 @@ export class SyncEngine {
 	/** Returns the new head, or null if the file changed on GitHub meanwhile (merged next sync). */
 	private async pushAttachment(a: Attachment, head: Head, result: SyncResult): Promise<Head | null> {
 		const { path, sha } = a.change;
-		await this.uploadBlob(path, a.data, sha!);
+		// Read now, one attachment at a time. If it changed since the scan, the next sync sends it.
+		const data = await this.local.read(path);
+		if ((await gitBlobSha(data)) !== sha) {
+			result.skipped.push(path);
+			return null;
+		}
+		await this.uploadBlob(path, data, sha!);
 		for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
 			const treeSha = await this.remote.createTree(head.treeSha, [{ path, mode: a.change.mode, sha }]);
 			const name = path.split("/").pop();
-			const message = `${this.opts.deviceName}: attachment ${name} (${formatSize(a.data.length)})\n\n${a.kind}: ${path}\n\nAttachment: ${path}\n`;
+			const message = `${this.opts.deviceName}: attachment ${name} (${formatSize(a.size)})\n\n${a.kind}: ${path}\n\nAttachment: ${path}\n`;
 			const commit = await this.remote.createCommit(message, treeSha, [head.commit]);
 			if (await this.publish(commit)) {
 				this.state.base[path] = sha!;
@@ -463,10 +499,12 @@ export class SyncEngine {
 					this.log(error);
 					result.failed.push({ path, error, direction: "up" });
 				} else {
-					attachments.push({ change, kind, data, remoteSha: r?.sha });
+					attachments.push({ change, kind, size: data.length, remoteSha: r?.sha });
 				}
 			}),
 			CONCURRENCY * 4,
+			this.budget(),
+			[...paths].map((p) => this.state.shaCache[p]?.size ?? 0),
 		);
 
 		// A scan that silently missed files would look like a mass delete; refuse that.
@@ -593,17 +631,24 @@ export class SyncEngine {
 		const cache = this.state.shaCache;
 		const fresh: SyncState["shaCache"] = {};
 		const out = new Map<string, string>();
+		const cached = (e: LocalEntry) => {
+			const hit = cache[e.path];
+			return hit && hit.mtime === e.mtime && hit.size === e.size ? hit.sha : null;
+		};
+		this.rehashed = 0;
 		await runLimited(
 			entries.map((e) => async () => {
-				const hit = cache[e.path];
-				const sha =
-					hit && hit.mtime === e.mtime && hit.size === e.size
-						? hit.sha
-						: await gitBlobSha(await this.local.read(e.path));
+				let sha = cached(e);
+				if (sha === null) {
+					sha = await gitBlobSha(await this.local.read(e.path));
+					this.rehashed++;
+				}
 				fresh[e.path] = { mtime: e.mtime, size: e.size, sha };
 				out.set(e.path, sha);
 			}),
 			CONCURRENCY * 4,
+			this.budget(),
+			entries.map((e) => (cached(e) === null ? e.size : 0)),
 		);
 		this.state.shaCache = fresh;
 		return out;
@@ -624,19 +669,37 @@ function exactText(data: Uint8Array): string | null {
 	return back.length === data.length && back.every((b, i) => b === data[i]) ? text : null;
 }
 
-/** Run tasks, at most `limit` at once. On the first failure, start no new ones, let running ones finish, then throw. */
-async function runLimited(tasks: Array<() => Promise<void>>, limit: number): Promise<void> {
+/**
+ * Run tasks, at most `limit` at once and, when weights are given, at most `budget`
+ * of weight (bytes) at once; a task heavier than the whole budget runs on its own.
+ * On the first failure, start no new ones, let running ones finish, then throw.
+ */
+async function runLimited(tasks: Array<() => Promise<void>>, limit: number, budget = Infinity, weights?: number[]): Promise<void> {
 	let next = 0;
+	let running = 0;
+	let inFlight = 0;
 	let failure: { error: unknown } | null = null;
-	const worker = async () => {
-		while (!failure && next < tasks.length) {
-			try {
-				await tasks[next++]();
-			} catch (error) {
-				failure ??= { error };
+	await new Promise<void>((resolve) => {
+		const pump = () => {
+			while (!failure && next < tasks.length && running < limit) {
+				const weight = weights?.[next] ?? 0;
+				if (running > 0 && inFlight + weight > budget) break;
+				const task = tasks[next++];
+				running++;
+				inFlight += weight;
+				task()
+					.catch((error) => {
+						failure ??= { error };
+					})
+					.finally(() => {
+						running--;
+						inFlight -= weight;
+						pump();
+					});
 			}
-		}
-	};
-	await Promise.all(Array.from({ length: Math.min(limit, tasks.length) }, worker));
+			if (running === 0 && (failure || next >= tasks.length)) resolve();
+		};
+		pump();
+	});
 	if (failure) throw (failure as { error: unknown }).error;
 }

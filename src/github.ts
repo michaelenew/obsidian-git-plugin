@@ -174,7 +174,7 @@ export class GitHub implements RemoteStore {
 		for (const e of t.tree) {
 			// Plain files only: submodules (160000) and symlinks (120000) are skipped.
 			if (e.type === "blob" && (e.mode === "100644" || e.mode === "100755")) {
-				entries.set(e.path, { sha: e.sha, mode: e.mode });
+				entries.set(e.path, { sha: e.sha, mode: e.mode, size: e.size });
 			}
 		}
 		return entries;

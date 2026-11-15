@@ -434,6 +434,20 @@ export class SettingsTab extends PluginSettingTab {
 			);
 
 		new Setting(el)
+			.setName("Largest file to download (MB)")
+			.setDesc("Bigger files stay on GitHub and are listed as not synced on this device. Phones can run out of memory on very big files, so they default to 50. 0 means no limit.")
+			.addText((t) =>
+				t.setValue(String(s.maxDownloadMB)).onChange(async (v) => {
+					const n = Number(v);
+					if (Number.isFinite(n) && n >= 0) {
+						s.maxDownloadMB = n;
+						plugin.resetEngine();
+						await save();
+					}
+				}),
+			);
+
+		new Setting(el)
 			.setName("Also ignore")
 			.setDesc("Extra patterns to skip, one per line, same format as .gitignore. Git repositories inside the vault are always skipped.")
 			.addTextArea((t) =>
