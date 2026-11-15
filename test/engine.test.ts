@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { emptyState, LocalEntry, LocalStore, RemoteStore, RemoteTree, SyncEngine, TreeChange } from "../src/engine";
+import { EngineOptions, emptyState, LocalEntry, LocalStore, RemoteStore, RemoteTree, SyncEngine, TreeChange } from "../src/engine";
 import { gitBlobSha } from "../src/sha";
 
 const enc = (s: string) => new TextEncoder().encode(s);
@@ -59,7 +59,7 @@ class FakeGitHub implements RemoteStore {
 	}
 	async getTree(commit: string): Promise<RemoteTree> {
 		const treeSha = this.commits.get(commit)!.tree;
-		return { treeSha, entries: new Map(this.trees.get(treeSha)!) };
+		return { treeSha, entries: this.withSizes(this.trees.get(treeSha)!) };
 	}
 	async getBlob(sha: string) {
 		return this.blobs.get(sha)!;
@@ -91,7 +91,10 @@ class FakeGitHub implements RemoteStore {
 		return tree;
 	}
 	async listTree(treeSha: string) {
-		return new Map(this.trees.get(treeSha)!);
+		return this.withSizes(this.trees.get(treeSha)!);
+	}
+	withSizes(entries: Map<string, { sha: string; mode: string }>) {
+		return new Map([...entries].map(([p, e]) => [p, { ...e, size: this.blobs.get(e.sha)!.length }]));
 	}
 	async createCommit(message: string, tree: string, parents: string[]) {
 		const commit = `c${this.n++}`;
@@ -147,9 +150,10 @@ class FakeDisk implements LocalStore {
 	}
 }
 
-function device(gh: FakeGitHub, name: string, disk = new FakeDisk()) {
+function device(gh: FakeGitHub, name: string, disk = new FakeDisk(), extra: Partial<EngineOptions> = {}) {
 	const state = emptyState("x");
 	const engine = new SyncEngine(disk, gh, {
+		...extra,
 		branch: "main",
 		deviceName: name,
 		deviceBranch: `sync/${name}`,
@@ -529,4 +533,80 @@ test("a pull that finds nothing new says so, instead of reporting no failures", 
 	assert.deepEqual(first.failed.map((f) => f.path), ["Plan?.md"]);
 	const quick = await engine.sync("pull");
 	assert.equal(quick.unchanged, true);
+});
+
+/** Tracks the most bytes being worked on at once by an async step. */
+function meter() {
+	let now = 0;
+	const m = { max: 0, async track<T>(bytes: number, step: () => Promise<T>): Promise<T> {
+		now += bytes;
+		m.max = Math.max(m.max, now);
+		await new Promise((r) => setTimeout(r, 1));
+		try {
+			return await step();
+		} finally {
+			now -= bytes;
+		}
+	} };
+	return m;
+}
+
+test("downloads and file reads stay within the memory budget; a bigger file goes alone", async () => {
+	const gh = new FakeGitHub();
+	const files: Record<string, string> = { "huge.md": "x".repeat(50) };
+	for (let i = 0; i < 12; i++) files[`n${i}.md`] = "y".repeat(10);
+	await gh.seed(files);
+	const disk = new FakeDisk();
+	const { engine } = device(gh, "phone", disk, { memoryBudget: 25 });
+
+	const down = meter();
+	const getBlob = gh.getBlob.bind(gh);
+	gh.getBlob = (sha) => down.track(gh.blobs.get(sha)!.length, () => getBlob(sha));
+	await engine.sync("full");
+	assert.equal(disk.files.size, 13);
+	assert.ok(down.max <= 50, `at most the one big file at a time (saw ${down.max})`);
+
+	// Make every file look changed so the next scan reads them all again.
+	for (const [p, f] of disk.files) disk.files.set(p, { data: f.data, mtime: f.mtime + 1000 });
+	const reads = meter();
+	const read = disk.read.bind(disk);
+	disk.read = (p) => reads.track(disk.files.get(p)!.data.length, () => read(p));
+	await engine.sync("full");
+	assert.ok(reads.max <= 50, `scan stays within budget (saw ${reads.max})`);
+	assert.ok(reads.max >= 20, "but small files are still read in parallel");
+});
+
+test("files over this device's download limit stay on GitHub, and nothing is deleted", async () => {
+	const gh = new FakeGitHub();
+	await gh.seed({ "note.md": "hi", "video.m4a": "z".repeat(100) });
+	const { disk, engine, state } = device(gh, "phone", new FakeDisk(), { maxDownloadSize: 50 });
+	const r = await engine.sync("full");
+	assert.equal(disk.get("note.md"), "hi");
+	assert.equal(disk.get("video.m4a"), undefined);
+	assert.match(r.failed[0].error, /^"video\.m4a" \(100 B\) is bigger than this device's download limit \(50 B\), so it stays on GitHub/);
+	assert.equal(state.base["video.m4a"], undefined);
+	disk.put("other.md", "x");
+	await engine.sync("full");
+	assert.equal(gh.files()["video.m4a"], "z".repeat(100), "still on GitHub");
+});
+
+test("attachments are read one at a time when pushed, not all held in memory", async () => {
+	const gh = new FakeGitHub();
+	await gh.seed({ "README.md": "hi" });
+	const disk = new FakeDisk();
+	for (let i = 0; i < 5; i++) disk.files.set(`p${i}.png`, { data: new Uint8Array(20).fill(0xff - i), mtime: 0 });
+	const { engine } = device(gh, "mac", disk, { memoryBudget: 1000 });
+	await engine.sync("full"); // first scan
+	const reads: string[] = [];
+	const read = disk.read.bind(disk);
+	disk.read = async (p) => (reads.push(p), read(p));
+	const uploads: string[] = [];
+	const createBlob = gh.createBlob.bind(gh);
+	gh.createBlob = async (d) => (uploads.push(`after ${reads.length} reads`), createBlob(d));
+	for (let i = 0; i < 5; i++) disk.files.set(`q${i}.png`, { data: new Uint8Array(20).fill(0x80 + i), mtime: 0 });
+	await engine.sync("full");
+	// 11 reads to see what changed (the 5 new files twice, plus README.md, downloaded last
+	// sync), then each attachment is read again right before it's sent.
+	assert.deepEqual(uploads, ["after 12 reads", "after 13 reads", "after 14 reads", "after 15 reads", "after 16 reads"]);
+	assert.equal(Object.keys(gh.files()).filter((p) => p.startsWith("q")).length, 5);
 });

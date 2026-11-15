@@ -26,6 +26,8 @@ export interface Settings {
 	appSlug: string;
 	/** Moved the login from the shared pre-0.1.6 storage entry to this vault's own */
 	tokenMigrated: boolean;
+	/** Don't download files bigger than this to this device; 0 for no limit */
+	maxDownloadMB: number;
 }
 
 function defaultDeviceName(): string {
@@ -34,7 +36,7 @@ function defaultDeviceName(): string {
 	return `${kind}-${Math.random().toString(36).slice(2, 6)}`;
 }
 
-const DEFAULTS: Omit<Settings, "deviceName"> = {
+const DEFAULTS: Omit<Settings, "deviceName" | "maxDownloadMB"> = {
 	repo: "",
 	branch: "",
 	username: "",
@@ -93,7 +95,8 @@ export default class SimpleGitSync extends Plugin {
 
 	async onload() {
 		const data = (await this.loadData()) ?? {};
-		this.settings = { ...DEFAULTS, deviceName: defaultDeviceName(), ...data.settings };
+		// Phones run out of memory on very big files, so they get a limit by default.
+		this.settings = { ...DEFAULTS, deviceName: defaultDeviceName(), maxDownloadMB: Platform.isMobile ? 50 : 0, ...data.settings };
 		this.state = data.state ?? emptyState(this.target());
 		this.notified = new Set(data.notified ?? []);
 		await this.save();
@@ -345,6 +348,9 @@ export default class SimpleGitSync extends Plugin {
 			},
 			log: (m) => this.addLog(m),
 			progress: (m) => this.progress(m),
+			// On mobile each file crosses into the app as text several times its size.
+			memoryBudget: (Platform.isMobile ? 16 : 128) * 1024 * 1024,
+			maxDownloadSize: this.settings.maxDownloadMB > 0 ? this.settings.maxDownloadMB * 1024 * 1024 : null,
 		});
 		return this.engine;
 	}
