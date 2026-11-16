@@ -162,6 +162,10 @@ export interface EngineOptions {
 	 * killed mid-way (out of memory on a phone), the next start knows which file it was.
 	 */
 	onHeavy?: (starting: boolean, action: HeavyAction, path: string, size: number) => Promise<void>;
+	/** Report files from this size up to onHeavy (default HEAVY_FILE; 0 reports every file) */
+	heavyThreshold?: number;
+	/** How many files to read at once when checking for changes (default 16) */
+	scanConcurrency?: number;
 }
 
 const MAX_ATTEMPTS = 4;
@@ -199,7 +203,7 @@ export class SyncEngine {
 
 	/** Run fn, telling onHeavy before and after if the file is big. */
 	private async heavy<T>(action: HeavyAction, path: string, size: number, fn: () => Promise<T>): Promise<T> {
-		const report = size >= HEAVY_FILE ? this.opts.onHeavy : undefined;
+		const report = size >= (this.opts.heavyThreshold ?? HEAVY_FILE) ? this.opts.onHeavy : undefined;
 		await report?.(true, action, path, size);
 		try {
 			return await fn();
@@ -225,17 +229,25 @@ export class SyncEngine {
 		throw new Error(`${this.opts.branch} kept changing while pushing; will try again later`);
 	}
 
-	/** Local changes not yet on GitHub. */
+	/**
+	 * Local changes not yet on GitHub, for display. Reads no files: a file whose size or
+	 * date changed since it was last checked counts as changed. (Reading everything here,
+	 * alongside a sync doing the same, used too much memory on phones.)
+	 */
 	async pendingChanges(): Promise<Change[]> {
-		const local = await this.scanLocal();
+		const entries = await this.local.list();
 		const changes: Change[] = [];
-		for (const [path, sha] of local) {
-			const b = this.state.base[path];
-			if (b === undefined) changes.push({ path, kind: "added" });
-			else if (b !== sha) changes.push({ path, kind: "modified" });
+		const present = new Set<string>();
+		for (const e of entries) {
+			present.add(e.path);
+			const b = this.state.base[e.path];
+			const hit = this.state.shaCache[e.path];
+			const sha = hit && hit.mtime === e.mtime && hit.size === e.size ? hit.sha : null;
+			if (b === undefined) changes.push({ path: e.path, kind: "added" });
+			else if (sha !== b) changes.push({ path: e.path, kind: "modified" });
 		}
 		for (const path of Object.keys(this.state.base)) {
-			if (!local.has(path) && !this.local.isExcluded(path)) changes.push({ path, kind: "deleted" });
+			if (!present.has(path) && !this.local.isExcluded(path)) changes.push({ path, kind: "deleted" });
 		}
 		return changes.sort((a, b) => a.path.localeCompare(b.path));
 	}
@@ -255,6 +267,7 @@ export class SyncEngine {
 			return { result, attachments: [], head: { commit: head, treeSha: "" } };
 		}
 
+		this.opts.progress?.("getting the file list from GitHub");
 		const tree = await this.getTree(head);
 		const local = await this.scanLocal();
 		// Reading every file is the slow part; keep the result even if the app is killed later.
@@ -653,6 +666,7 @@ export class SyncEngine {
 
 	/** path -> blob id for every local file, re-reading only files whose size or mtime changed. */
 	private async scanLocal(): Promise<Map<string, string>> {
+		this.opts.progress?.("listing files on this device");
 		const entries = await this.local.list();
 		const cache = this.state.shaCache;
 		const fresh: SyncState["shaCache"] = {};
@@ -662,17 +676,21 @@ export class SyncEngine {
 			return hit && hit.mtime === e.mtime && hit.size === e.size ? hit.sha : null;
 		};
 		this.rehashed = 0;
+		let checked = 0;
+		const toCheck = entries.filter((e) => cached(e) === null).length;
+		if (toCheck) this.opts.progress?.(`checking ${toCheck} changed files`);
 		await runLimited(
 			entries.map((e) => async () => {
 				let sha = cached(e);
 				if (sha === null) {
 					sha = await this.heavy("reading", e.path, e.size, async () => gitBlobSha(await this.local.read(e.path)));
 					this.rehashed++;
+					if (toCheck > 10) this.opts.progress?.(`checking file ${++checked} of ${toCheck}`);
 				}
 				fresh[e.path] = { mtime: e.mtime, size: e.size, sha };
 				out.set(e.path, sha);
 			}),
-			CONCURRENCY * 4,
+			this.opts.scanConcurrency ?? CONCURRENCY * 4,
 			this.budget(),
 			entries.map((e) => (cached(e) === null ? e.size : 0)),
 		);

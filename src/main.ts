@@ -53,7 +53,7 @@ const DEFAULTS: Omit<Settings, "deviceName" | "maxDownloadMB"> = {
 	tokenMigrated: false,
 };
 
-export type Phase = "logged-out" | "no-repo" | "idle" | "syncing" | "offline" | "error";
+export type Phase = "logged-out" | "no-repo" | "idle" | "syncing" | "offline" | "paused" | "error";
 
 export interface Status {
 	phase: Phase;
@@ -246,12 +246,19 @@ export default class SimpleGitSync extends Plugin {
 			if (manual) new Notice("You're offline. Changes will sync when you're back online.");
 			return;
 		}
+		if (this.pausedAfterCrash && !manual) {
+			this.setPhase("paused", "");
+			return;
+		}
+		this.pausedAfterCrash = false;
 		if (this.running) {
 			if (this.rerun !== "full") this.rerun = mode;
 			return;
 		}
 		this.running = true;
 		this.setPhase("syncing", mode === "full" ? "syncing…" : "checking GitHub…");
+		this.crumb = { steps: [], files: new Map() };
+		await this.step(`${mode === "full" ? "full sync" : "check for changes"} started`, true);
 		const dirtyAtStart = new Set(this.dirty);
 		const loginAtStart = this.credentials();
 		try {
@@ -292,6 +299,7 @@ export default class SimpleGitSync extends Plugin {
 			}
 		} finally {
 			this.running = false;
+			this.clearCrumb();
 		}
 		const next = this.rerun;
 		this.rerun = null;
@@ -357,6 +365,9 @@ export default class SimpleGitSync extends Plugin {
 			},
 			log: (m) => this.addLog(m),
 			progress: (m) => this.progress(m),
+			// On phones every file is noted, since a crash there leaves no other trace.
+			heavyThreshold: Platform.isMobile ? 0 : undefined,
+			scanConcurrency: Platform.isMobile ? 4 : undefined,
 			onHeavy: (starting, action, path, size) => this.trackHeavy(starting, action, path, size),
 			// On mobile each file crosses into the app as text several times its size.
 			memoryBudget: (Platform.isMobile ? 16 : 128) * 1024 * 1024,
@@ -510,15 +521,20 @@ export default class SimpleGitSync extends Plugin {
 
 	// ---- crash tracking ---------------------------------------------------
 	//
-	// A phone can kill Obsidian outright when it runs out of memory, taking the
-	// activity log with it. So the big file being worked on is noted in a small
-	// file in this plugin's folder (never synced), and cleared when done. If the
-	// note is still there at the next start, Obsidian closed during that file.
-	// After two such closes on the same file, it is skipped on this device.
+	// A phone can kill Obsidian outright (e.g. out of memory), taking the activity
+	// log with it. So while a sync runs, its recent steps and the files being worked
+	// on are kept in a small file in this plugin's folder (never synced), removed when
+	// the sync ends. If it's still there at the next start, Obsidian closed mid-sync:
+	// the steps go into the log, automatic sync pauses so Obsidian stays usable, and a
+	// file that was in progress during two such closes is skipped on this device.
 
 	/** path -> times Obsidian closed while handling it, on this device */
 	private crashSuspects: Record<string, number> = {};
-	private heavyNow = new Map<string, { action: HeavyAction; size: number }>();
+	private crumb = { steps: [] as Array<{ at: string; text: string }>, files: new Map<string, { action: HeavyAction; size: number }>() };
+	private crumbWrites: Promise<void> = Promise.resolve();
+	private lastCrumbWrite = 0;
+	/** The last session ended mid-sync; don't sync again until the user asks */
+	private pausedAfterCrash = false;
 
 	private pluginDir() {
 		return this.manifest.dir ?? `${this.app.vault.configDir}/plugins/${this.manifest.id}`;
@@ -528,47 +544,73 @@ export default class SimpleGitSync extends Plugin {
 		return `${this.pluginDir()}/in-progress.json`;
 	}
 
+	/** Record a step. Writes are queued; `now` writes even if one just happened, and waits for it. */
+	private step(text: string, now = false): Promise<void> {
+		if (!this.active || !this.running) return Promise.resolve();
+		this.crumb.steps.push({ at: new Date().toISOString(), text });
+		if (this.crumb.steps.length > 40) this.crumb.steps.shift();
+		if (!now && Date.now() - this.lastCrumbWrite < 300) return Promise.resolve();
+		this.lastCrumbWrite = Date.now();
+		const body = JSON.stringify({
+			at: new Date().toISOString(),
+			steps: this.crumb.steps,
+			files: [...this.crumb.files].map(([path, f]) => ({ path, ...f })),
+		});
+		this.crumbWrites = this.crumbWrites.then(() => this.app.vault.adapter.write(this.inProgressFile(), body)).catch(() => {});
+		return this.crumbWrites;
+	}
+
+	private clearCrumb() {
+		this.crumb = { steps: [], files: new Map() };
+		if (!this.active) return;
+		this.crumbWrites = this.crumbWrites.then(() => this.app.vault.adapter.remove(this.inProgressFile())).catch(() => {});
+	}
+
 	private async trackHeavy(starting: boolean, action: HeavyAction, path: string, size: number) {
 		if (!this.active) return;
 		if (starting) {
-			this.heavyNow.set(path, { action, size });
-		} else {
-			this.heavyNow.delete(path);
-			// It went through, so it isn't what's crashing Obsidian.
-			if (this.crashSuspects[path]) {
-				delete this.crashSuspects[path];
-				void this.save();
-			}
+			this.crumb.files.set(path, { action, size });
+			// Wait until it's on disk: if this file is what kills Obsidian, the note must say so.
+			await this.step(`${action} ${path} (${formatMB(size)})`, true);
+			return;
 		}
-		const files = [...this.heavyNow].map(([p, f]) => ({ path: p, ...f }));
-		const adapter = this.app.vault.adapter;
-		if (files.length) await adapter.write(this.inProgressFile(), JSON.stringify({ at: new Date().toISOString(), files }));
-		else await adapter.remove(this.inProgressFile()).catch(() => {});
+		this.crumb.files.delete(path);
+		// It went through, so it isn't what's crashing Obsidian.
+		if (this.crashSuspects[path]) {
+			delete this.crashSuspects[path];
+			void this.save();
+		}
 	}
 
 	private async checkLastSession() {
 		const adapter = this.app.vault.adapter;
-		let note: { at: string; files: Array<{ path: string; action: HeavyAction; size: number }> } | null = null;
+		type Note = { at: string; steps?: Array<{ at: string; text: string }>; files?: Array<{ path: string; action: HeavyAction; size: number }> };
+		let note: Note | null = null;
 		try {
 			if (await adapter.exists(this.inProgressFile())) note = JSON.parse(await adapter.read(this.inProgressFile()));
 		} catch {
 			/* unreadable: ignore */
 		}
 		await adapter.remove(this.inProgressFile()).catch(() => {});
-		if (!note?.files?.length) return;
-		const lines: string[] = [];
-		for (const f of note.files) {
+		if (!note) return;
+
+		this.pausedAfterCrash = true;
+		const files: string[] = [];
+		for (const f of note.files ?? []) {
 			const n = (this.crashSuspects[f.path] ?? 0) + 1;
 			this.crashSuspects[f.path] = n;
-			const what = `${f.action} "${f.path}" (${(f.size / 1024 / 1024).toFixed(1)} MB)`;
-			lines.push(n >= 2 ? `${what}: this happened ${n} times, so it's now skipped on this device` : what);
+			const what = `${f.action} "${f.path}" (${formatMB(f.size)})`;
+			files.push(n >= 2 ? `${what}: the second time, so it's now skipped on this device` : what);
 		}
-		const when = new Date(note.at).toLocaleString();
-		this.addLog(`Obsidian closed unexpectedly (${when}) while ${lines.join("; ")}`);
 		await this.save();
+		// Oldest first, so the log reads newest-first like the rest.
+		for (const s of note.steps ?? []) this.addLog(`(before the crash, ${new Date(s.at).toLocaleTimeString()}) ${s.text}`);
+		this.addLog(`Obsidian closed unexpectedly during a sync (last noted ${new Date(note.at).toLocaleString()})${files.length ? ` while ${files.join("; ")}` : ""}`);
+		const last = note.steps?.[note.steps.length - 1]?.text;
 		new Notice(
-			`Git sync: last time, Obsidian closed (or crashed) while:\n\n${lines.map((l) => `• ${l}`).join("\n")}\n\n` +
-				"If it happens twice with the same file, that file is skipped on this device and listed in the sync panel.",
+			"Git sync: last time, Obsidian closed (or crashed) during a sync" +
+				(files.length ? ` while:\n${files.map((l) => `• ${l}`).join("\n")}` : last ? `, just after: ${last}` : "") +
+				"\n\nAutomatic syncing is paused so Obsidian stays usable. Open the sync panel (↻) to copy the details, then tap Sync now to resume.",
 			0,
 		);
 	}
@@ -633,6 +675,7 @@ export default class SimpleGitSync extends Plugin {
 	private progress(message: string) {
 		if (this.status.phase !== "syncing") return;
 		this.status.message = message;
+		void this.step(message);
 		if (Date.now() - this.lastProgress < 500) return;
 		this.lastProgress = Date.now();
 		this.refresh();
@@ -680,6 +723,10 @@ export default class SimpleGitSync extends Plugin {
 	}
 }
 
+function formatMB(bytes: number): string {
+	return bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)} MB` : `${Math.ceil(bytes / 1024)} KB`;
+}
+
 export function ago(d: Date | null): string {
 	if (!d) return "never";
 	const s = Math.round((Date.now() - d.getTime()) / 1000);
@@ -693,6 +740,7 @@ export function statusLine(p: SimpleGitSync): string {
 		case "logged-out": return "Git: not logged in";
 		case "no-repo": return "Git: choose a repository";
 		case "syncing": return `Git: ${p.status.message || "syncing…"}`;
+		case "paused": return "Git: paused after a crash";
 		case "offline": return `Git: offline${p.dirtyCount() ? ` · ${p.dirtyCount()} unpushed` : ""}`;
 		case "error": return "Git: sync error";
 		default: return `Git: synced ${ago(p.status.lastSync)}${p.dirtyCount() ? ` · ${p.dirtyCount()} unpushed` : ""}${p.status.failed.length ? ` · ${p.status.failed.length} not synced` : ""}`;
