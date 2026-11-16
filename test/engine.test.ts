@@ -635,3 +635,23 @@ test("a file the phone skips after crashes is left alone everywhere", async () =
 	await engine.sync("full");
 	assert.equal(gh.files()["huge.png"], "big");
 });
+
+test("listing pending changes for the panel reads no files", async () => {
+	const gh = new FakeGitHub();
+	await gh.seed({ "a.md": "A", "b.md": "B" });
+	const { disk, engine } = device(gh, "phone");
+	await engine.sync("full");
+	await engine.sync("full"); // records the downloaded files' sizes and dates
+	disk.put("a.md", "A edited");
+	disk.put("new.md", "N");
+	disk.files.delete("b.md");
+	let reads = 0;
+	const read = disk.read.bind(disk);
+	disk.read = async (p) => (reads++, read(p));
+	assert.deepEqual(await engine.pendingChanges(), [
+		{ path: "a.md", kind: "modified" },
+		{ path: "b.md", kind: "deleted" },
+		{ path: "new.md", kind: "added" },
+	]);
+	assert.equal(reads, 0);
+});

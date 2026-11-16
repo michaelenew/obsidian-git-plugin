@@ -247,6 +247,9 @@ export class SyncPanel extends ItemView {
 
 		el.createEl("div", { text: statusLine(this.plugin), cls: `sgs-status sgs-${status.phase}` });
 		if (status.phase === "error") el.createEl("div", { text: status.message, cls: "sgs-error" });
+		if (status.phase === "paused") {
+			el.createEl("div", { text: "Last time, Obsidian closed during a sync, so automatic syncing is paused. The steps before it closed are in the activity below; use Copy details to share them. Sync now resumes.", cls: "sgs-error" });
+		}
 		if (status.phase === "offline") {
 			el.createEl("div", { text: `Can't reach GitHub${status.message && status.message !== "Offline" ? ` (${status.message})` : ""}. Edits are kept and will sync automatically when the connection is back.`, cls: "sgs-muted" });
 		}
