@@ -122,6 +122,11 @@ interface Head {
 	treeSha: string;
 }
 
+export type HeavyAction = "reading" | "downloading" | "uploading";
+
+/** Files at least this big are reported to onHeavy. */
+export const HEAVY_FILE = 1024 * 1024;
+
 export interface SyncFailure {
 	path: string;
 	error: string;
@@ -152,6 +157,11 @@ export interface EngineOptions {
 	memoryBudget?: number;
 	/** Don't download files bigger than this to this device (bytes); null for no limit. */
 	maxDownloadSize?: number | null;
+	/**
+	 * Told (and awaited) just before and after work on a big file, so that if the app is
+	 * killed mid-way (out of memory on a phone), the next start knows which file it was.
+	 */
+	onHeavy?: (starting: boolean, action: HeavyAction, path: string, size: number) => Promise<void>;
 }
 
 const MAX_ATTEMPTS = 4;
@@ -185,6 +195,17 @@ export class SyncEngine {
 
 	private log(msg: string) {
 		this.opts.log?.(msg);
+	}
+
+	/** Run fn, telling onHeavy before and after if the file is big. */
+	private async heavy<T>(action: HeavyAction, path: string, size: number, fn: () => Promise<T>): Promise<T> {
+		const report = size >= HEAVY_FILE ? this.opts.onHeavy : undefined;
+		await report?.(true, action, path, size);
+		try {
+			return await fn();
+		} finally {
+			await report?.(false, action, path, size);
+		}
 	}
 
 	private budget(): number {
@@ -256,10 +277,11 @@ export class SyncEngine {
 		const weights: number[] = [];
 		// A file that can't be saved here (bad name, disk full, ...) is reported; the rest still syncs.
 		const schedule = (path: string, task: () => Promise<void>) => {
-			weights.push(remote.get(path)?.size ?? 0);
+			const size = remote.get(path)?.size ?? 0;
+			weights.push(size);
 			work.push(async () => {
 				try {
-					await task();
+					await this.heavy("downloading", path, size, task);
 				} catch (e) {
 					if (e instanceof Error && FATAL_ERRORS.has(e.name)) throw e;
 					settled = false;
@@ -432,12 +454,16 @@ export class SyncEngine {
 	private async pushAttachment(a: Attachment, head: Head, result: SyncResult): Promise<Head | null> {
 		const { path, sha } = a.change;
 		// Read now, one attachment at a time. If it changed since the scan, the next sync sends it.
-		const data = await this.local.read(path);
-		if ((await gitBlobSha(data)) !== sha) {
+		const sent = await this.heavy("uploading", path, a.size, async () => {
+			const data = await this.local.read(path);
+			if ((await gitBlobSha(data)) !== sha) return false;
+			await this.uploadBlob(path, data, sha!);
+			return true;
+		});
+		if (!sent) {
 			result.skipped.push(path);
 			return null;
 		}
-		await this.uploadBlob(path, data, sha!);
 		for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
 			const treeSha = await this.remote.createTree(head.treeSha, [{ path, mode: a.change.mode, sha }]);
 			const name = path.split("/").pop();
@@ -479,7 +505,7 @@ export class SyncEngine {
 					if (r) out.push({ change: { path, mode: r.mode, sha: null }, kind: "deleted" });
 					return;
 				}
-				const data = await this.local.read(path);
+				const data = await this.heavy("reading", path, this.state.shaCache[path]?.size ?? 0, () => this.local.read(path));
 				const sha = await gitBlobSha(data);
 				if (r?.sha === sha) return;
 				if (forbidden.length) {
@@ -640,7 +666,7 @@ export class SyncEngine {
 			entries.map((e) => async () => {
 				let sha = cached(e);
 				if (sha === null) {
-					sha = await gitBlobSha(await this.local.read(e.path));
+					sha = await this.heavy("reading", e.path, e.size, async () => gitBlobSha(await this.local.read(e.path)));
 					this.rehashed++;
 				}
 				fresh[e.path] = { mtime: e.mtime, size: e.size, sha };

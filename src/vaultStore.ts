@@ -7,6 +7,8 @@ export interface VaultStoreOptions {
 	extraIgnore: string;
 	/** This plugin's own folder. Never synced: it holds per-device state. */
 	pluginDir: string;
+	/** Files skipped on this device because Obsidian closed while handling them */
+	skip: Set<string>;
 }
 
 /**
@@ -43,6 +45,7 @@ export class VaultStore implements LocalStore {
 			if (path === pluginDir || path.startsWith(pluginDir + "/")) return true;
 			if (segs.length === 2 && /^workspace.*\.json$|^workspaces\.json$/.test(name)) return true;
 		}
+		if (this.opts().skip.has(path)) return true;
 		for (const repo of this.nestedRepos) {
 			if (path === repo || path.startsWith(repo + "/")) return true;
 		}
