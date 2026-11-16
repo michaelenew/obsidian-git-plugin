@@ -263,6 +263,7 @@ export class SyncPanel extends ItemView {
 			}, true);
 			button(buttons, "Refresh", () => this.reloadPending());
 		}
+		if (this.plugin.skippedFiles().size) button(buttons, "Retry skipped files", () => this.plugin.retrySkipped());
 		button(buttons, "Copy details", async () => {
 			await navigator.clipboard.writeText(this.report());
 			new Notice("Sync details copied");
@@ -435,12 +436,13 @@ export class SettingsTab extends PluginSettingTab {
 
 		new Setting(el)
 			.setName("Largest file to download (MB)")
-			.setDesc("Bigger files stay on GitHub and are listed as not synced on this device. Phones can run out of memory on very big files, so they default to 50. 0 means no limit.")
+			.setDesc("Bigger files stay on GitHub and are listed as not synced on this device. Phones can run out of memory on very big files, so they default to 15. 0 means no limit.")
 			.addText((t) =>
 				t.setValue(String(s.maxDownloadMB)).onChange(async (v) => {
 					const n = Number(v);
 					if (Number.isFinite(n) && n >= 0) {
 						s.maxDownloadMB = n;
+						s.downloadLimitChosen = true;
 						plugin.resetEngine();
 						await save();
 					}

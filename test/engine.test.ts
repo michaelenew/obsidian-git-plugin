@@ -610,3 +610,28 @@ test("attachments are read one at a time when pushed, not all held in memory", a
 	assert.deepEqual(uploads, ["after 12 reads", "after 13 reads", "after 14 reads", "after 15 reads", "after 16 reads"]);
 	assert.equal(Object.keys(gh.files()).filter((p) => p.startsWith("q")).length, 5);
 });
+
+test("big-file work is reported before and after, so a crash mid-way can be traced", async () => {
+	const gh = new FakeGitHub();
+	await gh.seed({ "small.md": "hi", "big.png": "\xff".repeat(2 * 1024 * 1024) });
+	const events: string[] = [];
+	const { engine } = device(gh, "phone", new FakeDisk(), {
+		onHeavy: async (starting, action, path) => void events.push(`${starting ? "start" : "end"} ${action} ${path}`),
+	});
+	await engine.sync("full");
+	assert.deepEqual(events, ["start downloading big.png", "end downloading big.png"]);
+});
+
+test("a file the phone skips after crashes is left alone everywhere", async () => {
+	const gh = new FakeGitHub();
+	await gh.seed({ "note.md": "hi", "huge.png": "big" });
+	const disk = new FakeDisk();
+	const skip = new Set(["huge.png"]);
+	disk.excluded = (p) => skip.has(p);
+	const { engine } = device(gh, "phone", disk);
+	await engine.sync("full");
+	assert.equal(disk.get("huge.png"), undefined);
+	disk.put("other.md", "x");
+	await engine.sync("full");
+	assert.equal(gh.files()["huge.png"], "big");
+});

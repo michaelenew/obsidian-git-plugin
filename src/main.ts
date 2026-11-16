@@ -1,5 +1,5 @@
 import { Notice, Platform, Plugin, TAbstractFile, TFile } from "obsidian";
-import { Change, emptyState, Mode, SyncEngine, SyncFailure, SyncResult, SyncState } from "./engine";
+import { Change, emptyState, HeavyAction, Mode, SyncEngine, SyncFailure, SyncResult, SyncState } from "./engine";
 import { Auth, AuthError, Credentials, isOffline, NetworkError } from "./auth";
 import { GitHub } from "./github";
 import { unannounced } from "./notify";
@@ -28,6 +28,8 @@ export interface Settings {
 	tokenMigrated: boolean;
 	/** Don't download files bigger than this to this device; 0 for no limit */
 	maxDownloadMB: number;
+	/** The user set maxDownloadMB themselves */
+	downloadLimitChosen?: boolean;
 }
 
 function defaultDeviceName(): string {
@@ -96,9 +98,13 @@ export default class SimpleGitSync extends Plugin {
 	async onload() {
 		const data = (await this.loadData()) ?? {};
 		// Phones run out of memory on very big files, so they get a limit by default.
-		this.settings = { ...DEFAULTS, deviceName: defaultDeviceName(), maxDownloadMB: Platform.isMobile ? 50 : 0, ...data.settings };
+		this.settings = { ...DEFAULTS, deviceName: defaultDeviceName(), maxDownloadMB: Platform.isMobile ? 15 : 0, ...data.settings };
+		// 0.1.11's phone default of 50 MB still crashed a phone; move it down unless the user chose it.
+		if (Platform.isMobile && this.settings.maxDownloadMB === 50 && !this.settings.downloadLimitChosen) this.settings.maxDownloadMB = 15;
 		this.state = data.state ?? emptyState(this.target());
 		this.notified = new Set(data.notified ?? []);
+		this.crashSuspects = data.crashSuspects ?? {};
+		await this.checkLastSession();
 		await this.save();
 
 		this.registerView(PANEL_VIEW, (leaf) => new SyncPanel(leaf, this));
@@ -131,6 +137,8 @@ export default class SimpleGitSync extends Plugin {
 	onunload() {
 		// A sync in flight can't be cancelled, so make sure it can't do anything more.
 		this.active = false;
+		// A normal unload (update, turned off) isn't a crash.
+		void this.app.vault.adapter.remove(this.inProgressFile()).catch(() => {});
 		this.auth.stop();
 		if (this.timer !== null) window.clearTimeout(this.timer);
 	}
@@ -300,7 +308,7 @@ export default class SimpleGitSync extends Plugin {
 		if (!r.unchanged) {
 			// Uploads are only tried in full syncs, so a pull keeps the last full sync's upload failures.
 			const ups = (r.mode === "full" ? r.failed : this.status.failed).filter((f) => f.direction === "up");
-			this.status.failed = [...ups, ...r.failed.filter((f) => f.direction === "down")];
+			this.status.failed = [...ups, ...r.failed.filter((f) => f.direction === "down"), ...this.skippedFailures()];
 			this.notifyFailures(this.status.failed);
 		}
 		if (r.conflicts.length) {
@@ -324,7 +332,8 @@ export default class SimpleGitSync extends Plugin {
 			() => ({
 				includeConfigDir: this.settings.includeConfigDir,
 				extraIgnore: this.settings.extraIgnore,
-				pluginDir: this.manifest.dir ?? `${this.app.vault.configDir}/plugins/${this.manifest.id}`,
+				pluginDir: this.pluginDir(),
+				skip: this.skippedFiles(),
 			}),
 			(path) => this.selfWrites.set(path, Date.now()),
 		);
@@ -348,6 +357,7 @@ export default class SimpleGitSync extends Plugin {
 			},
 			log: (m) => this.addLog(m),
 			progress: (m) => this.progress(m),
+			onHeavy: (starting, action, path, size) => this.trackHeavy(starting, action, path, size),
 			// On mobile each file crosses into the app as text several times its size.
 			memoryBudget: (Platform.isMobile ? 16 : 128) * 1024 * 1024,
 			maxDownloadSize: this.settings.maxDownloadMB > 0 ? this.settings.maxDownloadMB * 1024 * 1024 : null,
@@ -498,6 +508,92 @@ export default class SimpleGitSync extends Plugin {
 		this.schedule("full", 0);
 	}
 
+	// ---- crash tracking ---------------------------------------------------
+	//
+	// A phone can kill Obsidian outright when it runs out of memory, taking the
+	// activity log with it. So the big file being worked on is noted in a small
+	// file in this plugin's folder (never synced), and cleared when done. If the
+	// note is still there at the next start, Obsidian closed during that file.
+	// After two such closes on the same file, it is skipped on this device.
+
+	/** path -> times Obsidian closed while handling it, on this device */
+	private crashSuspects: Record<string, number> = {};
+	private heavyNow = new Map<string, { action: HeavyAction; size: number }>();
+
+	private pluginDir() {
+		return this.manifest.dir ?? `${this.app.vault.configDir}/plugins/${this.manifest.id}`;
+	}
+
+	private inProgressFile() {
+		return `${this.pluginDir()}/in-progress.json`;
+	}
+
+	private async trackHeavy(starting: boolean, action: HeavyAction, path: string, size: number) {
+		if (!this.active) return;
+		if (starting) {
+			this.heavyNow.set(path, { action, size });
+		} else {
+			this.heavyNow.delete(path);
+			// It went through, so it isn't what's crashing Obsidian.
+			if (this.crashSuspects[path]) {
+				delete this.crashSuspects[path];
+				void this.save();
+			}
+		}
+		const files = [...this.heavyNow].map(([p, f]) => ({ path: p, ...f }));
+		const adapter = this.app.vault.adapter;
+		if (files.length) await adapter.write(this.inProgressFile(), JSON.stringify({ at: new Date().toISOString(), files }));
+		else await adapter.remove(this.inProgressFile()).catch(() => {});
+	}
+
+	private async checkLastSession() {
+		const adapter = this.app.vault.adapter;
+		let note: { at: string; files: Array<{ path: string; action: HeavyAction; size: number }> } | null = null;
+		try {
+			if (await adapter.exists(this.inProgressFile())) note = JSON.parse(await adapter.read(this.inProgressFile()));
+		} catch {
+			/* unreadable: ignore */
+		}
+		await adapter.remove(this.inProgressFile()).catch(() => {});
+		if (!note?.files?.length) return;
+		const lines: string[] = [];
+		for (const f of note.files) {
+			const n = (this.crashSuspects[f.path] ?? 0) + 1;
+			this.crashSuspects[f.path] = n;
+			const what = `${f.action} "${f.path}" (${(f.size / 1024 / 1024).toFixed(1)} MB)`;
+			lines.push(n >= 2 ? `${what}: this happened ${n} times, so it's now skipped on this device` : what);
+		}
+		const when = new Date(note.at).toLocaleString();
+		this.addLog(`Obsidian closed unexpectedly (${when}) while ${lines.join("; ")}`);
+		await this.save();
+		new Notice(
+			`Git sync: last time, Obsidian closed (or crashed) while:\n\n${lines.map((l) => `• ${l}`).join("\n")}\n\n` +
+				"If it happens twice with the same file, that file is skipped on this device and listed in the sync panel.",
+			0,
+		);
+	}
+
+	skippedFiles(): Set<string> {
+		return new Set(Object.entries(this.crashSuspects).filter(([, n]) => n >= 2).map(([p]) => p));
+	}
+
+	private skippedFailures(): SyncFailure[] {
+		return [...this.skippedFiles()].map((path) => ({
+			path,
+			direction: "down" as const,
+			error: `"${path}" is skipped on this device: Obsidian closed twice while handling it (probably not enough memory). It's safe on GitHub. To try again, use "Retry skipped files" in the sync panel.`,
+		}));
+	}
+
+	async retrySkipped() {
+		for (const p of this.skippedFiles()) delete this.crashSuspects[p];
+		this.status.failed = this.status.failed.filter((f) => !f.error.includes("is skipped on this device"));
+		this.resetEngine();
+		await this.save();
+		this.refresh();
+		this.schedule("full", 0);
+	}
+
 	// ---- status ---------------------------------------------------------
 
 	private setPhase(phase: Phase, message: string) {
@@ -580,7 +676,7 @@ export default class SimpleGitSync extends Plugin {
 	async save() {
 		// An unloaded copy's state is out of date; the new copy owns data.json now.
 		if (!this.active) return;
-		await this.saveData({ settings: this.settings, state: this.state, notified: [...this.notified] });
+		await this.saveData({ settings: this.settings, state: this.state, notified: [...this.notified], crashSuspects: this.crashSuspects });
 	}
 }
 

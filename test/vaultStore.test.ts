@@ -32,7 +32,7 @@ test("skips nested repos, config, trash and gitignored files", async () => {
 		".obsidian/app.json": "", ".obsidian/plugins/simple-git-sync/data.json": "", ".trash/old.md": "",
 		".git/config": "", "a/.DS_Store": "",
 	});
-	const store = new VaultStore(app, () => ({ includeConfigDir: false, extraIgnore: "", pluginDir: ".obsidian/plugins/simple-git-sync" }), () => {});
+	const store = new VaultStore(app, () => ({ includeConfigDir: false, extraIgnore: "", pluginDir: ".obsidian/plugins/simple-git-sync", skip: new Set<string>() }), () => {});
 	const listed = (await store.list()).map((e) => e.path).sort();
 	assert.deepEqual(listed, [".gitignore", "img/pic.png", "note.md", "projects/notes.md"]);
 	// Remote paths inside a nested repo are skipped too.
@@ -45,7 +45,7 @@ test("config folder opt-in still never includes this plugin's folder or layout f
 		".obsidian/app.json": "", ".obsidian/workspace.json": "", ".obsidian/workspace-mobile.json": "",
 		".obsidian/plugins/simple-git-sync/data.json": "", ".obsidian/plugins/other/main.js": "",
 	});
-	const store = new VaultStore(app, () => ({ includeConfigDir: true, extraIgnore: "", pluginDir: ".obsidian/plugins/simple-git-sync" }), () => {});
+	const store = new VaultStore(app, () => ({ includeConfigDir: true, extraIgnore: "", pluginDir: ".obsidian/plugins/simple-git-sync", skip: new Set<string>() }), () => {});
 	const listed = (await store.list()).map((e) => e.path).sort();
 	assert.deepEqual(listed, [".obsidian/app.json", ".obsidian/plugins/other/main.js"]);
 });
@@ -54,7 +54,7 @@ test("on Android, names with characters it forbids are flagged", async () => {
 	const { Platform } = await import("obsidian");
 	Object.assign(Platform, { isMobile: true, isAndroidApp: true });
 	try {
-		const store = new VaultStore(fakeApp({}), () => ({ includeConfigDir: false, extraIgnore: "", pluginDir: ".obsidian/plugins/simple-git-sync" }), () => {});
+		const store = new VaultStore(fakeApp({}), () => ({ includeConfigDir: false, extraIgnore: "", pluginDir: ".obsidian/plugins/simple-git-sync", skip: new Set<string>() }), () => {});
 		assert.equal(store.nameProblem("notes/Plan: v2?.md"), 'its name contains ":" "?", which Android doesn\'t allow in file names');
 		assert.equal(store.nameProblem("photos/Hawaii /a.jpg"), null);
 	} finally {
